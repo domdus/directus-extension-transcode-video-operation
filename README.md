@@ -17,7 +17,8 @@ This extension adds a custom operation to Directus Flows that automatically tran
 - **High Bit Depth Support**: Automatically detects and converts 10-bit videos to 8-bit for maximum compatibility
 - **Folder Organization**: Automatically creates and organizes transcoded files in Directus folders
 - **Video Metadata Extraction**: Extracts dimensions, duration, and orientation information
-- **Storage Location Support**: Works with any Directus storage adapter (local, S3, etc.)
+- **Storage Location Support**: Works with local storage adapter (S3, etc. not tested)
+- **Streaming Video Player Integration**: Works seamlessly with the [Streaming Video Player](https://github.com/domdus/directus-extension-streaming-video-player) extension ([details](#integration-with-streaming-video-player))
 
 ## Requirements
 
@@ -87,21 +88,39 @@ npm run build
   - `0` = Use all available CPU cores (fastest, but may impact system performance)
   - Note: More threads = faster encoding, but higher CPU usage
 
-### Example Flow Configuration
+### Example Flow Configuration (Collection Item Trigger)
 
-**Trigger**: Event Hook
-- **Scope**: `items.create`
-- **Collections**: `directus_files`
-- **Filter**: `type` contains `video`
+**Trigger**: Manual trigger
+- **Collections**: `your_collection`
+- **Asynchronous**: `enabled`
 
-**Operation**: Transcode Video Operation
-- **File**: `{{ $trigger.body.key }}`
-- **Folder ID**: `{{ $trigger.body.folder }}` (or a specific folder UUID)
+**Read Data**: Read `your_collection` with video field query:
+- **IDs**: `{{$trigger.body.keys[0]}}`
+- **Query**:
+```json
+{
+    "fields": "*,video.*"
+}
+```
+
+ **Transcode Video Operation**: 
+ - **File**: `{{ $last.video }}`
+- **Folder ID**: `{{ $last.video.folder }}` (or a specific folder UUID)
 - **Playlist Reference Type**: `id`
 - **Quality Levels**: `["240p", "480p", "720p", "1080p"]`
 - **Thread Count**: `1` (or `0` for all cores, `4` for 4 threads, etc.)
 
+**Update Data**: Update `your_collection` with payload:
+```json
+{
+    "stream_link": "/assets/{{$last.master.id}}",
+    "image": "{{$last.metadata.thumbnail}}"
+}
+```
+
 <img width="600px" alt="screenshot_flow_collection" src="https://raw.githubusercontent.com/domdus/directus-extension-transcode-video-operation/main/docs/screenshot_flow_collection.png" />
+
+*Collection Flow Example (sets stream link field in directus file)*
 
 ## Output Structure
 
