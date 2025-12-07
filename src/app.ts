@@ -3,7 +3,7 @@ export default {
 	name: 'Transcode Video Operation',
 	icon: 'extension',
 	description: 'Transcode input file to HLS streams with multiple quality levels',
-	overview: ({ file, folder_id }) => [
+	overview: ({ file, folder_id }: { file?: any; folder_id?: string }) => [
 		{
 			label: 'File',
 			text: file,

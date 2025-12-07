@@ -2,14 +2,92 @@ import fs from 'fs';
 import path from 'path';
 import { exec } from "child_process";
 
+interface OperationContext {
+	env: {
+		STORAGE_LOCATIONS?: string;
+		[key: string]: string | number | undefined;
+	};
+	services: {
+		FilesService: new (options: { schema: Record<string, any>; accountability?: any }) => any;
+		FoldersService: new (options: { schema: Record<string, any>; accountability?: any }) => any;
+		[key: string]: any;
+	};
+	getSchema: () => Promise<Record<string, any>>;
+	logger?: {
+		info?: (message: string, ...args: any[]) => void;
+		warn?: (message: string, ...args: any[]) => void;
+		error?: (message: string, ...args: any[]) => void;
+		debug?: (message: string, ...args: any[]) => void;
+	};
+}
+
+interface File {
+	filename_disk: string;
+	storage: string;
+	[key: string]: any;
+}
+
+interface OperationInput {
+	file?: File;
+	folder_id?: string;
+	playlist_reference_type?: 'id' | 'filename_disk';
+	qualities?: string[] | string;
+	threads?: number | string;
+}
+
+interface QualityOption {
+	id: number;
+	options: string;
+}
+
+interface VideoMetadata {
+	width: number;
+	height: number;
+	isVertical: boolean;
+	duration: number;
+}
+
+interface ImageMetadata {
+	width: number;
+	height: number;
+}
+
+interface UploadedFile {
+	filename_disk: string;
+	id: string;
+}
+
+interface OperationResult {
+	master: {
+		id: string | null;
+		filename_disk: string;
+	};
+	metadata: {
+		availableQualities: number[];
+		dimensions: {
+			width: number;
+			height: number;
+			isVertical: boolean;
+		};
+		duration: number;
+		thumbnail: string | null;
+	};
+	files: UploadedFile[];
+	error?: string;
+}
+
 export default {
 	id: 'transcode-video-operation',
-	handler: async({ file, folder_id, playlist_reference_type = 'id', qualities = ['240p', '480p', '720p', '1080p', '2160p'], threads = 1 }, { env, services, getSchema, logger }) => {
-		// if(!env?.RUN_FLOWS) {
-		// 	throw {
-		// 		message: "Run flows is not allowed"
-		// 	};
-		// }
+	handler: async (
+		{ 
+			file, 
+			folder_id, 
+			playlist_reference_type = 'id', 
+			qualities = ['240p', '480p', '720p', '1080p', '2160p'], 
+			threads = 1 
+		}: OperationInput, 
+		{ env, services, getSchema, logger }: OperationContext
+	): Promise<OperationResult | { error: string }> => {
 		if (!file?.filename_disk) {
 			logger?.info("[transcode-video-operation] Input file missing");
 			throw new Error("Input file missing");
@@ -31,10 +109,10 @@ export default {
 		const storageAdapter = storageLocations.length > 0 ? storageLocations[0] : "local";
 		const storageLocation = env[`STORAGE_${storageAdapter.toUpperCase()}_ROOT`];
 		// outputDir will be set later based on the source file's directory
-		let outputDir;
+		let outputDir: string;
 		
 		// Function to generate optimized quality options for raw exec commands
-		const getQualityOptionsRaw = (isHighBitDepth = false) => {
+		const getQualityOptionsRaw = (isHighBitDepth = false): QualityOption[] => {
 			// Always use main profile for maximum compatibility
 			const profile = 'main';
 			
@@ -66,25 +144,25 @@ export default {
 		};
 		const hlsFolderId = folder_id;
 		
-		const resolveStorage = (location) => {
+		const resolveStorage = (location: string): string | null => {
 			const envKey = `STORAGE_${location.toUpperCase()}_ROOT`;
 			const envValue = env[envKey];
 
 			if (envValue) {
-				return envValue;
+				return String(envValue);
 			} else {
 				logger?.warn(`[transcode-video-operation] (${filename}) No storage found for location <%s>`, location);
 				return null;
 			}
 		}
 
-		const readFiles = (linkFilePath) => {
+		const readFiles = (linkFilePath: string): string[] => {
 			const data = fs.readdirSync(linkFilePath, 'utf-8').filter(fn => fn.startsWith(filename));
 			return data;
 		}
 
 		// Get video metadata (dimensions, duration)
-		const getVideoMetadata = async (inputFile) => {
+		const getVideoMetadata = async (inputFile: string): Promise<VideoMetadata> => {
 			return new Promise((resolve, reject) => {
 				// Get width, height, duration, and rotation
 				exec(`ffprobe -v error -select_streams v:0 -show_entries stream=width,height:format=duration -of json ${inputFile}`, 
@@ -120,7 +198,7 @@ export default {
 		};
 
 		// Extract thumbnail at 1 second
-		const extractThumbnail = async (inputFile, outputPath) => {
+		const extractThumbnail = async (inputFile: string, outputPath: string): Promise<string> => {
 			return new Promise((resolve, reject) => {
 				exec(`ffmpeg -y -i ${inputFile} -ss 1 -vframes 1 -q:v 2 ${outputPath}`, (error) => {
 					if (error) {
@@ -134,7 +212,7 @@ export default {
 		};
 
 		// Get image metadata (dimensions)
-		const getImageMetadata = async (imagePath) => {
+		const getImageMetadata = async (imagePath: string): Promise<ImageMetadata> => {
 			return new Promise((resolve, reject) => {
 				exec(`ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of json ${imagePath}`, 
 					(error, stdout) => {
@@ -166,7 +244,7 @@ export default {
 		};
 
 		// Create folder in Directus if it doesn't exist
-		const ensureFolder = async (folderName, parentFolderId = null) => {
+		const ensureFolder = async (folderName: string, parentFolderId: string | null = null): Promise<string> => {
 			try {
 				const { FoldersService } = services;
 				const foldersService = new FoldersService({
@@ -174,7 +252,7 @@ export default {
 				});
 
 				// Build filter to find existing folder
-				const filter = { name: { _eq: folderName } };
+				const filter: any = { name: { _eq: folderName } };
 				if (parentFolderId) {
 					filter.parent = { _eq: parentFolderId };
 				}
@@ -184,14 +262,14 @@ export default {
 					filter: filter
 				});
 
-				if (existingFolders && existingFolders.length > 0) {
+				if (existingFolders && Array.isArray(existingFolders) && existingFolders.length > 0) {
 					const folderId = existingFolders[0]?.id || existingFolders[0]?.data?.id || existingFolders[0];
 					logger?.info(`[transcode-video-operation] (${filename}) Found existing folder: ${folderId}`);
-					return folderId;
+					return String(folderId);
 				}
 
 				// Create new folder
-				const folderData = { name: folderName };
+				const folderData: any = { name: folderName };
 				if (parentFolderId) {
 					folderData.parent = parentFolderId;
 					logger?.info(`[transcode-video-operation] (${filename}) Creating folder "${folderName}" with parent ${parentFolderId}`);
@@ -210,7 +288,7 @@ export default {
 				}
 				
 				logger?.info(`[transcode-video-operation] (${filename}) Created folder with ID: ${folderId}`);
-				return folderId;
+				return String(folderId);
 			} catch (error) {
 				logger?.error(`[transcode-video-operation] (${filename}) Error creating folder:`, error);
 				throw error;
@@ -218,7 +296,11 @@ export default {
 		};
 
 		// Create file record in Directus (file is already in storage, no upload needed)
-		const uploadFileToDirectus = async (filePath, folderId = null, options = {}) => {
+		const uploadFileToDirectus = async (
+			filePath: string, 
+			folderId: string | null = null, 
+			options: { mimetype?: string; width?: number | null; height?: number | null } = {}
+		): Promise<string> => {
 			try {
 				const { FilesService } = services;
 				const filesService = new FilesService({
@@ -229,7 +311,7 @@ export default {
 				const extension = fileName.substr(fileName.lastIndexOf('.') + 1);
 				const fileSizeInBytes = fs.statSync(filePath).size;
 				
-				const types = {
+				const types: Record<string, string> = {
 					ts: "video/mp2t",
 					mp4: "video/mp4",
 					jpeg: "image/jpeg",
@@ -242,7 +324,7 @@ export default {
 				const fileStream = fs.createReadStream(filePath);
 
 				// Prepare file data
-				const fileData = {
+				const fileData: any = {
 					storage: storageAdapter,
 					filename_disk: fileName,
 					filename_download: fileName,
@@ -282,7 +364,7 @@ export default {
 					throw new Error(`Failed to get file ID from response. Response: ${JSON.stringify(fileRecord)}`);
 				}
 
-				return fileId;
+				return String(fileId);
 			} catch (error) {
 				logger?.error(`[transcode-video-operation] (${filename}) Error creating file record for ${filePath}:`, error);
 				throw error;
@@ -290,10 +372,10 @@ export default {
 		};
 
 		// Parse m3u8 file and replace filenames with file IDs or filename_disk
-		const rebuildPlaylist = (playlistPath, fileIdMap, useFilenameDisk = false) => {
+		const rebuildPlaylist = (playlistPath: string, fileIdMap: Record<string, string>, useFilenameDisk = false): string => {
 			let content = fs.readFileSync(playlistPath, 'utf-8');
 			const lines = content.split('\n');
-			const newLines = [];
+			const newLines: string[] = [];
 
 			for (const line of lines) {
 				if (line.startsWith('#') || line.trim() === '') {
@@ -329,7 +411,7 @@ export default {
 			return newLines.join('\n');
 		};
 
-		function checkFFmpegAvailable() {
+		function checkFFmpegAvailable(): Promise<void> {
 			return new Promise((resolve, reject) => {
 				exec('which ffmpeg', (error, stdout, stderr) => {
 					if (error || !stdout.trim()) {
@@ -341,7 +423,7 @@ export default {
 			});
 		}
 
-		function ffmpegRawSync(inputFile, quality) {
+		function ffmpegRawSync(inputFile: string, quality: QualityOption, validatedThreads: number): Promise<string> {
 			return new Promise((resolve, reject) => {
 				exec(`ffmpeg -y -i ${inputFile} -threads ${validatedThreads} ${quality.options}`, (error, stdout, stderr) => {
 					if (error) {
@@ -361,16 +443,6 @@ export default {
 						return;
 					}
 
-					// fs.copyFileSync('./playlist.m3u8', `${outputPath}/playlist.m3u8`);
-			
-					// const videoUrl = `http://localhost:8000/uploads/hls-videos/${videoId}/playlist.m3u8`
-			
-					// try{
-					// 	storelink(videoUrl);
-					// } catch(error){
-					// 	logger?.error(`[ERROR] error while storing video URL: ${error}`);
-					// 	res.json({"error": "Error while processing your file. Please try again."})
-					// }
 					logger?.info(`[transcode-video-operation] (${filename}) Transcoding finished for quality: %s`, quality.id);
 					resolve(stdout.trim());
 				})
@@ -382,7 +454,7 @@ export default {
 		
 		// Ensure threads is a number (may come as string from form input)
 		// 0 means use all available cores, 1+ means use that many threads
-		const threadCount = threads !== undefined && threads !== null ? parseInt(threads, 10) : 1;
+		const threadCount = threads !== undefined && threads !== null ? parseInt(String(threads), 10) : 1;
 		const validatedThreads = (isNaN(threadCount) || threadCount < 0) ? 1 : threadCount;
 
 		const storagePath = resolveStorage(file.storage);
@@ -421,12 +493,12 @@ export default {
 			await checkFFmpegAvailable();
 			logger?.info(`[transcode-video-operation] (${filename}) FFmpeg is available`);
 		} catch (error) {
-			logger?.error(`[transcode-video-operation] (${filename}) FFmpeg check failed: %s`, error.message);
+			logger?.error(`[transcode-video-operation] (${filename}) FFmpeg check failed: %s`, error instanceof Error ? error.message : String(error));
 			throw error;
 		}
 
 		// Check if input is 10-bit by examining the video stream
-		const isHighBitDepth = await new Promise((resolve, reject) => {
+		const isHighBitDepth = await new Promise<boolean>((resolve, reject) => {
 				exec(`ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of json ${filePath}`, 
 					(error, stdout) => {
 						if (error) {
@@ -467,7 +539,7 @@ export default {
 		// Filter qualities based on user selection (default: all)
 		// Handle cases where qualities might be undefined, null, or not an array
 		// Tags interface returns strings with "p" suffix (e.g., "240p"), so default is also strings with "p"
-		let selectedQualities = ['240p', '480p', '720p', '1080p', '2160p']; // Default: all qualities
+		let selectedQualities: string[] = ['240p', '480p', '720p', '1080p', '2160p']; // Default: all qualities
 		if (qualities) {
 			if (Array.isArray(qualities)) {
 				selectedQualities = qualities;
@@ -483,7 +555,7 @@ export default {
 		
 		// Convert to numbers (tags interface returns strings)
 		// Strip "p" suffix if present (e.g., "240p" -> 240)
-		selectedQualities = selectedQualities
+		const selectedQualitiesNumbers = selectedQualities
 			.map(q => {
 				if (typeof q === 'string') {
 					// Remove "p" suffix if present
@@ -495,7 +567,7 @@ export default {
 			.filter(q => !isNaN(q));
 		
 		// Map quality IDs to their target heights
-		const qualityHeights = {
+		const qualityHeights: Record<number, number> = {
 			240: 240,
 			480: 480,
 			720: 720,
@@ -504,7 +576,7 @@ export default {
 		};
 		
 		// Filter qualities: first by user selection, then by source resolution (prevent upscaling)
-		let qualitiesRaw = allQualitiesRaw.filter(quality => selectedQualities.includes(quality.id));
+		let qualitiesRaw = allQualitiesRaw.filter(quality => selectedQualitiesNumbers.includes(quality.id));
 		
 		// Filter out qualities that would require upscaling
 		const qualitiesBeforeFilter = qualitiesRaw.length;
@@ -521,7 +593,7 @@ export default {
 			logger?.info(`[transcode-video-operation] (${filename}) Filtered out ${qualitiesBeforeFilter - qualitiesRaw.length} quality level(s) that would require upscaling`);
 		}
 		
-		logger?.info(`[transcode-video-operation] (${filename}) Selected qualities: ${selectedQualities.join(', ')}`);
+		logger?.info(`[transcode-video-operation] (${filename}) Selected qualities: ${selectedQualitiesNumbers.join(', ')}`);
 		logger?.info(`[transcode-video-operation] (${filename}) Will transcode ${qualitiesRaw.length} quality levels`);
 		
 		if (qualitiesRaw.length === 0) {
@@ -540,7 +612,7 @@ export default {
 			for (const quality of qualitiesRaw) {
 				try {
 					logger?.info(`[transcode-video-operation] (${filename}) Starting transcoding for quality: %sp`, quality.id);
-					await ffmpegRawSync(filePath, quality);
+					await ffmpegRawSync(filePath, quality, validatedThreads);
 					logger?.info(`[transcode-video-operation] (${filename}) Successfully transcoded quality: %sp`, quality.id);
 				} catch (error) {
 					logger?.error(`[transcode-video-operation] (${filename}) Failed to transcode quality %sp:`, quality.id, error);
@@ -553,7 +625,7 @@ export default {
 		}
 
 		// Generate master playlist dynamically based on available quality files
-		const m3u8Content = ['#EXTM3U', '#EXT-X-VERSION:3'];
+		const m3u8Content: string[] = ['#EXTM3U', '#EXT-X-VERSION:3'];
 		
 		// Add available quality streams (only if the file exists)
 		for (const quality of qualitiesRaw) {
@@ -587,7 +659,7 @@ export default {
 
 		// Extract thumbnail
 		const thumbnailPath = `${outputDir}/${filename}_thumb.jpg`;
-		let thumbnailId = null;
+		let thumbnailId: string | null = null;
 		try {
 			await extractThumbnail(filePath, thumbnailPath);
 			logger?.info(`[transcode-video-operation] (${filename}) Thumbnail extracted`);
@@ -606,15 +678,15 @@ export default {
 		logger?.info(`[transcode-video-operation] (${filename}) Found ${files.length} files to upload`);
 
 		// Upload all files and create filename -> file ID map
-		const fileIdMap = {};
-		const uploadedFiles = [];
+		const fileIdMap: Record<string, string> = {};
+		const uploadedFiles: UploadedFile[] = [];
 
 		// Upload thumbnail first if it exists
 		if (fs.existsSync(thumbnailPath)) {
 			try {
 				// Get thumbnail dimensions
-				let thumbnailWidth = null;
-				let thumbnailHeight = null;
+				let thumbnailWidth: number | null = null;
+				let thumbnailHeight: number | null = null;
 				try {
 					const imageMetadata = await getImageMetadata(thumbnailPath);
 					thumbnailWidth = imageMetadata.width;
@@ -686,7 +758,7 @@ export default {
 		const masterPlaylistPath = `${outputDir}/${filename}_playlist.m3u8`;
 		const masterContent = fs.readFileSync(masterPlaylistPath, 'utf-8');
 		const masterLines = masterContent.split('\n');
-		const newMasterLines = [];
+		const newMasterLines: string[] = [];
 
 		for (const line of masterLines) {
 			if (line.startsWith('#') || line.trim() === '') {
@@ -719,7 +791,7 @@ export default {
 		fs.writeFileSync(masterPlaylistPath, newMasterLines.join('\n'));
 		
 		// Upload master playlist
-		let masterId = null;
+		let masterId: string | null = null;
 		try {
 			masterId = await uploadFileToDirectus(masterPlaylistPath, targetFolderId);
 			logger?.info(`[transcode-video-operation] (${filename}) Master playlist uploaded: ${masterId}`);
@@ -728,7 +800,7 @@ export default {
 		}
 
 		// Determine available qualities
-		const availableQualities = [];
+		const availableQualities: number[] = [];
 		for (const quality of qualitiesRaw) {
 			const qualityFile = `${outputDir}/${filename}_${quality.id}p.m3u8`;
 			if (fs.existsSync(qualityFile)) {
