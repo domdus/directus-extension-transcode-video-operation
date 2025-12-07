@@ -1,0 +1,47 @@
+{
+	"name": "directus-extension-transcode-video-operation",
+	"description": "Transcode uploaded videos to adaptive HLS streams with multiple quality levels (240p, 480p, 720p, 1080p, 4K)",
+	"icon": "extension",
+	"version": "1.0.0",
+	"keywords": [
+		"directus",
+		"directus-extension",
+		"directus-custom-operation",
+		"ffmpeg",
+		"hls",
+		"video",
+		"transcoding",
+		"encoding",
+		"streaming"
+	],
+	"type": "module",
+	"directus:extension": {
+		"type": "operation",
+		"path": {
+			"app": "dist/app.js",
+			"api": "dist/api.js"
+		},
+		"source": {
+			"app": "src/app.js",
+			"api": "src/api.js"
+		},
+		"host": "^11.0.0"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/domdus/directus-extension-transcode-video-operation.git"
+	},
+	"bugs": {
+		"url": "https://github.com/domdus/directus-extension-transcode-video-operation/issues"
+	},
+	"homepage": "https://github.com/domdus/directus-extension-transcode-video-operation#readme",
+	"scripts": {
+		"build": "directus-extension build",
+		"dev": "directus-extension build -w --no-minify",
+		"link": "directus-extension link"
+	},
+	"devDependencies": {
+		"@directus/extensions-sdk": "^17.0.0",
+		"vue": "^3.3.7"
+	}
+}
