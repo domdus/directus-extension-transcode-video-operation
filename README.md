@@ -25,6 +25,27 @@ This extension adds a custom operation to Directus Flows that automatically tran
 - **FFmpeg**: FFmpeg must be installed and available in the system PATH
   - Installation: `apt-get install ffmpeg` (Debian/Ubuntu) or `brew install ffmpeg` (macOS)
   - Verify: `ffmpeg -version` and `ffprobe -version`
+  - **Docker**: For Docker deployments (https://directus.io/docs/self-hosting/deploying#docker-compose-examples):
+    1. Add build configuration to your `docker-compose.yml`:
+       ```yaml
+       directus:
+         build:
+           context: .
+           dockerfile: Dockerfile
+       ```
+    2. Create a `Dockerfile` in the same directory with:
+       ```dockerfile
+       FROM directus/directus:11.13.2
+       
+       USER root
+       RUN apk add --no-cache ffmpeg
+       RUN ffmpeg -version && ffprobe -version
+       USER node
+       ```
+    3. Rebuild and restart your containers:
+       ```bash
+       docker compose up --build -d
+       ```
 
 ## Installation
 
