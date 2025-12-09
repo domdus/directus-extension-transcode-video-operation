@@ -59,17 +59,23 @@ This extension adds a custom operation to Directus Flows that automatically tran
 
 ### Manual Installation
 
-1. Build the extension:
+1. Install package
+
+```bash
+npm install directus-extension-transcode-video-operation
+```
+
+2. Build the extension:
 ```bash
 npm run build
 ```
 
-2. Copy the `dist` folder to your Directus extensions directory:
+3. Copy the `dist` folder to your Directus extensions directory:
 ```
-/extensions/directus-extension-transcode-video-operation/
+directus/extensions/directus-extension-transcode-video-operation/
 ```
 
-3. Restart your Directus instance
+4. Restart your Directus instance
 
 ## Usage
 
