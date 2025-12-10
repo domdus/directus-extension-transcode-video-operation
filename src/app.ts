@@ -19,10 +19,12 @@ export default {
 			name: 'File',
 			type: 'text',
 			meta: {
+				width: 'half',
 				interface: 'input',
 				options: {
-					placeholder: 'Directus Files Object',
+					placeholder: 'File UUID / File Object',
 				},
+				note: 'Input file UUID or file object.',
 			},
 			schema: {
 				required: true,
@@ -30,17 +32,15 @@ export default {
 		},
 		{
 			field: 'folder_id',
-			name: 'Folder ID',
-			type: 'text',
+			name: 'Folder',
+			type: 'uuid',
 			meta: {
-				interface: 'input',
-				options: {
-					placeholder: 'Enter Folder ID',
-				},
-				note: 'Entry point for storing all transcoded files. If not provided, a new folder will be created.',
+				width: 'half',
+				interface: 'system-folder',
+				note: 'Root folder for storing all transcoded files. If not provided, a new folder will be created.',
 			},
 			schema: {
-				required: true,
+				required: false,
 			},
 		},
 		{
@@ -48,6 +48,7 @@ export default {
 			name: 'Playlist Reference Type',
 			type: 'string',
 			meta: {
+				width: 'half',
 				interface: 'select-dropdown',
 				options: {
 					choices: [
@@ -55,7 +56,7 @@ export default {
 						{ text: 'Filename Disk (custom)', value: 'filename_disk' }
 					]
 				},
-				note: 'How playlists should reference segments: File UIDs for files in Directus (/assets/:uuid) or Filename Disk for resources stored in a custom location (/stream/:filename_disk.m3u8)'
+				note: 'How playlists should reference segments: File UUIDs for files in Directus (/assets/:uuid) or Filename Disk for resources stored in a custom location (/stream/:filename_disk.m3u8)'
 			},
 			schema: {
 				default_value: 'id'
@@ -83,18 +84,116 @@ export default {
 			}
 		},
 		{
+			field: 'storage_adapter',
+			name: 'Storage Adapter',
+			type: 'string',
+			meta: {
+				width: 'half',
+				interface: 'select-radio',
+				options: {
+					choices: [
+						{ text: 'Environment Configuration (First One)', value: 'default' },
+						{ text: 'Same as Source File', value: 'source' },
+						{ text: 'Other', value: 'custom' }
+					]
+				},
+				note: 'Select the storage adapter where transcoded files physically should be stored.'
+			},
+			schema: {
+				default_value: 'default'
+			}
+		},
+		{
+			field: 'target_storage',
+			name: 'Target Storage Location',
+			type: 'text',
+			meta: {
+				width: 'half',
+				interface: 'input',
+				options: {
+					placeholder: 'e.g., local, s3, gcs'
+				},
+				note: 'Specify the storage location name (must match one of your configured STORAGE_LOCATIONS)',
+				conditions: [
+					{
+						name: 'Hide when storage_adapter is not custom',
+						rule: {
+							_or: [
+								{
+									storage_adapter: {
+										_eq: 'default'
+									}
+								},
+								{
+									storage_adapter: {
+										_eq: 'source'
+									}
+								},
+								{
+									storage_adapter: {
+										_null: true
+									}
+								}
+							]
+						},
+						hidden: true
+					}
+				]
+			},
+			schema: {
+				required: false
+			}
+		},
+		{
+			field: 'performance_divider',
+			name: 'Performance Settings',
+			type: 'alias',
+			meta: {
+				width: 'full',
+				interface: 'presentation-divider',
+				special: ['alias', 'no-data'],
+				options: {
+					title: 'Performance Settings'
+				}
+			},
+			schema: {}
+		},
+		{
 			field: 'threads',
 			name: 'Thread Count',
 			type: 'integer',
 			meta: {
+				width: 'half',
 				interface: 'input',
 				options: {
-					placeholder: '1'
+					placeholder: '1',
+					min: 0,
+					step: 1
 				},
 				note: 'Number of threads to use for encoding. Use 1 for single-threaded, or 0 to use all available CPU cores. Default: 1'
 			},
 			schema: {
 				default_value: 1
+			}
+		},
+		{
+			field: 'nice',
+			name: 'Process Priority',
+			type: 'integer',
+			meta: {
+				width: 'half',
+				interface: 'input',
+				options: {
+					placeholder: '19',
+					min: 0,
+					max: 19,
+					step: 1
+				},
+				note: 'Process priority (nice value) for transcoding. Range: 0 (highest) to 19 (lowest). Keep priority low when transcoding kills your system.'
+			},
+			schema: {
+				default_value: 19,
+				required: false
 			}
 		}
 	],

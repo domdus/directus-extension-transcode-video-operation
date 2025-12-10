@@ -17,8 +17,15 @@ This extension adds a custom operation to Directus Flows that automatically tran
 - **High Bit Depth Support**: Automatically detects and converts 10-bit videos to 8-bit for maximum compatibility
 - **Folder Organization**: Automatically creates and organizes transcoded files in Directus folders
 - **Video Metadata Extraction**: Extracts dimensions, duration, and orientation information
-- **Storage Location Support**: Works with local storage adapter (S3, etc. not tested)
-- **Streaming Video Player Integration**: Works seamlessly with the [Streaming Video Player](https://github.com/domdus/directus-extension-streaming-video-player) extension ([details](#integration-with-streaming-video-player))
+- **Cloud Storage Support**: Works with local storage, S3, GCS, Azure, and other cloud storage adapters
+  - Automatically downloads source files from cloud storage for processing
+  - Uploads transcoded files to specified storage location
+  - Cleans up temporary local files when using cloud storage
+- **Flexible Storage Configuration**: Choose where transcoded files are stored:
+  - Environment default (first configured storage)
+  - Same as source file
+  - Custom storage location
+ 
 
 ## Requirements
 
@@ -92,28 +99,49 @@ directus/extensions/directus-extension-transcode-video-operation/
 
 ### Operation Parameters
 
-- **File** (required): The Directus file object to transcode
+- **File** (required): The Directus file to transcode
+  - Accepts: File UUID (string) or Directus File Object
   - Use `{{ $last }}` to reference the file from a previous operation
   - Example: `{{ $trigger.body.key }}` for event hook triggers
+  - Example: `{{ $last.video }}` for file object from collection
   
-- **Folder ID** (required): The Directus folder ID where transcoded files will be stored
+- **Folder** (optional): The Directus folder where transcoded files will be stored
+  - Uses Directus folder selector interface with create capabilities
+  - If not provided, a new folder will be created automatically
   - A subfolder with the video filename will be created automatically
   - All transcoded segments, playlists, and thumbnails will be stored in this folder structure
 
-- **Playlist Reference Type** (optional, default: `id`): How playlists should reference segments
-  - **`id`** (default): Uses Directus file IDs - playlists reference segments as `/assets/:file_id` to run against /assets endpoint
-  - **`filename_disk`**: Uses original filenames - playlists reference segments by filename (useful for custom streaming servers)
-  
 - **Quality Levels** (optional, default: all qualities): Select which quality levels to transcode
   - Available: 240p, 480p, 720p, 1080p, 2160p (4K)
   - Only qualities equal to or lower than source resolution will be transcoded (no upscaling)
   - Example: A 1080p source video will only transcode 240p, 480p, 720p, and 1080p (4K will be skipped)
+
+- **Storage Adapter** (optional, default: `Environment Configuration (First One)`): Where transcoded files should be stored
+  - **Environment Configuration (First One)**: Uses the first configured storage location from environment variables
+  - **Same as Source File**: Stores transcoded files in the same storage location as the source file
+  - **Other**: Allows specifying a custom storage location name (must match one of your configured `STORAGE_LOCATIONS`)
+
+- **Target Storage Location** (optional): Custom storage location name
+  - Only visible when "Storage Adapter" is set to "Other"
+  - Must match one of your configured storage locations (e.g., `local`, `s3`, `gcs`)
+  - Example: If you have `STORAGE_LOCATIONS="local,s3"`, you can specify `s3` here
 
 - **Thread Count** (optional, default: `1`): Number of CPU threads to use for encoding
   - `1` = Single-threaded encoding (default, most compatible)
   - `2+` = Use specific number of threads (e.g., `4` for 4 threads)
   - `0` = Use all available CPU cores (fastest, but may impact system performance)
   - Note: More threads = faster encoding, but higher CPU usage
+
+- **Process Priority** (optional, default: `19`): CPU priority (nice value) for transcoding process
+  - Range: 0 (default/highest priority) to 19 (lowest priority)
+  - Lower values = higher CPU priority (may impact system performance)
+  - Higher values = lower CPU priority (better for background processing)
+  - Recommended: Use `19` when transcoding might impact system performance
+  - **Note**: Only works on Unix-like systems (Linux, macOS). On Windows, this setting is ignored with a warning.
+
+- **Playlist Reference Type** (optional, default: `id`): How playlists should reference segments
+  - **`id`** (default): Uses Directus file IDs - playlists reference segments as `/assets/:file_id` to run against /assets endpoint
+  - **`filename_disk`**: Uses original filenames - playlists reference segments by filename (useful for custom streaming servers)
 
 ### Example Flow Configuration (Collection Item Trigger)
 
@@ -132,10 +160,12 @@ directus/extensions/directus-extension-transcode-video-operation/
 
  **Transcode Video Operation**: 
  - **File**: `{{ $last.video }}`
-- **Folder ID**: `{{ $last.video.folder }}` (or a specific folder UUID)
-- **Playlist Reference Type**: `id`
+- **Folder**: `{{ $last.video.folder }}` (or select/create via folder picker)
 - **Quality Levels**: `["240p", "480p", "720p", "1080p"]`
+- **Storage Adapter**: `Same as Source File` (or `Environment Configuration (First One)`, or `Other` with custom storage)
 - **Thread Count**: `1` (or `0` for all cores, `4` for 4 threads, etc.)
+- **Process Priority**: `19` (or `0` for higher priority)
+- **Playlist Reference Type**: `id`
 
 **Update Data**: Update `your_collection` with payload:
 ```json
@@ -207,17 +237,32 @@ The operation returns a JSON object with:
 
 ## How It Works
 
-1. **File Validation**: Checks that the input file exists and is accessible
-2. **Metadata Extraction**: Uses `ffprobe` to get video dimensions, duration, and bit depth
-3. **Quality Filtering**: Filters out quality levels that would require upscaling
-4. **Bit Depth Detection**: Detects 10-bit videos and adds pixel format conversion
-5. **Transcoding**: Uses `ffmpeg` to transcode each quality level sequentially
+1. **File Input Processing**: 
+   - If file is a UUID string, fetches the full file object from Directus
+   - If file is already a file object, uses it directly
+2. **Source File Handling**:
+   - **Local Storage**: Uses file directly from disk
+   - **Cloud Storage**: Downloads source file to temporary location for processing
+3. **Storage Configuration**: Determines target storage location based on user selection
+   - Resolves storage driver (local vs. cloud) from environment configuration
+4. **File Validation**: Checks that the input file exists and is accessible
+5. **Metadata Extraction**: Uses `ffprobe` to get video dimensions, duration, and bit depth
+6. **Quality Filtering**: Filters out quality levels that would require upscaling
+7. **Bit Depth Detection**: Detects 10-bit videos and adds pixel format conversion
+8. **Transcoding**: Uses `ffmpeg` to transcode each quality level sequentially
    - Creates HLS segments (`.ts` files) and quality playlists (`.m3u8`)
    - Uses H.264 codec with optimized settings for each quality
-6. **Master Playlist**: Generates master playlist with bandwidth and resolution metadata
-7. **Thumbnail Extraction**: Extracts thumbnail at 1 second mark
-8. **Folder Creation**: Creates Directus folder structure for organized storage
-9. **File Upload**: Uploads all transcoded files to Directus with proper metadata
+   - Applies process priority (nice value) on Unix-like systems
+9. **Master Playlist**: Generates master playlist with bandwidth and resolution metadata
+10. **Thumbnail Extraction**: Extracts thumbnail at 1 second mark (if not already exists)
+11. **Folder Creation**: Creates Directus virtual folder structure for organization
+12. **File Upload**: 
+    - Checks for existing files to prevent duplicates
+    - For cloud storage: Uploads files and cleans up local copies
+    - For local storage: Files remain on disk
+13. **Cleanup**: 
+    - Removes temporary downloaded source file (if from cloud storage)
+    - Removes local transcoded files (if target storage is cloud)
 
 ## Technical Details
 
@@ -229,6 +274,16 @@ The operation returns a JSON object with:
 - **Segment Duration**: 4 seconds
 - **Playlist Type**: VOD (Video on Demand)
 - **CRF**: 20 (constant rate factor for quality)
+- **Process Priority**: Configurable nice value (0-19) for CPU priority control
+
+### Storage Handling
+
+- **Local Storage**: Files are created directly on disk and registered in Directus
+- **Cloud Storage**: 
+  - Source files are downloaded via HTTP to temporary location for FFmpeg processing
+  - Transcoded files are uploaded to cloud storage via Directus FilesService
+  - Temporary local files are automatically cleaned up after upload
+- **Storage Detection**: Automatically detects storage driver type from environment configuration
 
 ### Quality Bitrates
 
