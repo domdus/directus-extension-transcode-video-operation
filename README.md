@@ -29,6 +29,7 @@ This extension adds a custom operation to Directus Flows that automatically tran
 
 ## Requirements
 
+- **HLS Capable Video Player**: The default HTML5 player won't play it. You need a player with HLS streaming support. For Directus Data Studio you can install the [Streaming Video Player extension](#integration-with-streaming-video-player)
 - **FFmpeg**: FFmpeg must be installed and available in the system PATH
   - Installation: `apt-get install ffmpeg` (Debian/Ubuntu) or `brew install ffmpeg` (macOS)
   - Verify: `ffmpeg -version` and `ffprobe -version`

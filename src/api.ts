@@ -3,6 +3,8 @@
 import fs from 'fs';
 import path from 'path';
 import { exec } from "child_process";
+import https from 'https';
+import http from 'http';
 
 // Type declaration for Node.js process global
 declare const process: {
@@ -15,8 +17,8 @@ declare const process: {
 
 interface OperationContext {
 	env: {
-		STORAGE_LOCATIONS?: string;
-		[key: string]: string | number | undefined;
+		STORAGE_LOCATIONS?: string | string[];
+		[key: string]: string | number | string[] | undefined;
 	};
 	services: {
 		FilesService: new (options: { schema: Record<string, any>; accountability?: any }) => any;
@@ -143,9 +145,46 @@ export default {
 		const filename = fileObject.filename_disk.split(('.'))[0];
 		const extension = fileObject.filename_disk.substr(fileObject.filename_disk.lastIndexOf('.') + 1);
 
-		// Get available storage locations from environment (STORAGE_LOCATIONS is CSV)
-		const storageLocations = env.STORAGE_LOCATIONS ? env.STORAGE_LOCATIONS.split(',').map(loc => loc.trim()) : [];
+		// Get available storage locations from environment (STORAGE_LOCATIONS can be CSV string or array)
+		const storageLocations = env.STORAGE_LOCATIONS 
+			? Array.isArray(env.STORAGE_LOCATIONS) 
+				? env.STORAGE_LOCATIONS.map(loc => String(loc).trim())
+				: String(env.STORAGE_LOCATIONS).split(',').map(loc => loc.trim())
+			: [];
 		const defaultStorageAdapter = storageLocations.length > 0 ? storageLocations[0] : "local";
+
+		// Helper function to validate if a storage location exists
+		const validateStorageExists = (location: string): boolean => {
+			const driverKey = `STORAGE_${location.toUpperCase()}_DRIVER`;
+			const driverValue = env[driverKey];
+			return !!driverValue;
+		}
+
+		// Helper functions for storage resolution (needed early for output directory determination)
+		const resolveStorage = (location: string): string | null => {
+			const envKey = `STORAGE_${location.toUpperCase()}_ROOT`;
+			const envValue = env[envKey];
+
+			if (envValue) {
+				return String(envValue);
+			} else {
+				logger.warn(`[transcode-video-operation] (${filename}) No storage found for location <%s>`, location);
+				return null;
+			}
+		}
+
+		const getStorageDriver = (location: string): string | null => {
+			const envKey = `STORAGE_${location.toUpperCase()}_DRIVER`;
+			const envValue = env[envKey];
+
+			if (envValue) {
+				return String(envValue);
+			} else {
+				// Default to 'local' if driver not specified (backward compatibility)
+				logger.warn(`[transcode-video-operation] (${filename}) No driver found for storage location <%s>, assuming 'local'`, location);
+				return 'local';
+			}
+		}
 
 		// Determine target storage adapter based on user selection
 		let targetStorageAdapter: string;
@@ -153,13 +192,14 @@ export default {
 			// Use the same storage as the source file
 			targetStorageAdapter = fileObject.storage || defaultStorageAdapter;
 		} else if (storage_adapter === 'custom' && target_storage) {
-			// Use custom storage if provided and valid
-			if (storageLocations.includes(target_storage)) {
-				targetStorageAdapter = target_storage;
-			} else {
-				logger.warn(`[transcode-video-operation] (${filename}) Custom storage "${target_storage}" not found in configured locations. Using default.`);
-				targetStorageAdapter = defaultStorageAdapter;
+			// Validate that the custom storage location exists
+			if (!validateStorageExists(target_storage)) {
+				const errorMsg = `Custom storage location "${target_storage}" does not exist. Please ensure STORAGE_${target_storage.toUpperCase()}_DRIVER is configured. Available locations: ${JSON.stringify(storageLocations)}`;
+				logger.error(`[transcode-video-operation] (${filename}) ${errorMsg}`);
+				throw new Error(errorMsg);
 			}
+			targetStorageAdapter = target_storage;
+			logger.info(`[transcode-video-operation] (${filename}) Using custom storage location: ${target_storage}`);
 		} else {
 			// Use environment default (first configured storage location)
 			targetStorageAdapter = defaultStorageAdapter;
@@ -167,7 +207,11 @@ export default {
 
 		logger.info(`[transcode-video-operation] (${filename}) Using storage adapter: ${targetStorageAdapter}`);
 
-		// outputDir will be set later based on the source file's directory
+		// Determine target storage driver early (used for output directory and cleanup)
+		const targetStorageDriver = getStorageDriver(targetStorageAdapter);
+		const isLocalTarget = targetStorageDriver === 'local';
+
+		// outputDir will be set later based on the target storage location
 		let outputDir: string;
 		
 		// Function to generate optimized quality options for raw exec commands
@@ -203,31 +247,6 @@ export default {
 		};
 		const hlsFolderId = folder_id;
 		
-		const resolveStorage = (location: string): string | null => {
-			const envKey = `STORAGE_${location.toUpperCase()}_ROOT`;
-			const envValue = env[envKey];
-
-			if (envValue) {
-				return String(envValue);
-			} else {
-				logger.warn(`[transcode-video-operation] (${filename}) No storage found for location <%s>`, location);
-				return null;
-			}
-		}
-
-		const getStorageDriver = (location: string): string | null => {
-			const envKey = `STORAGE_${location.toUpperCase()}_DRIVER`;
-			const envValue = env[envKey];
-
-			if (envValue) {
-				return String(envValue);
-			} else {
-				// Default to 'local' if driver not specified (backward compatibility)
-				logger.warn(`[transcode-video-operation] (${filename}) No driver found for storage location <%s>, assuming 'local'`, location);
-				return 'local';
-			}
-		}
-
 		const readFiles = (linkFilePath: string): string[] => {
 			const data = fs.readdirSync(linkFilePath, 'utf-8').filter(fn => fn.startsWith(filename));
 			return data;
@@ -272,13 +291,39 @@ export default {
 		// Extract thumbnail at 1 second
 		const extractThumbnail = async (inputFile: string, outputPath: string): Promise<string> => {
 			return new Promise((resolve, reject) => {
-				exec(`ffmpeg -y -i ${inputFile} -ss 1 -vframes 1 -q:v 2 ${outputPath}`, (error) => {
+				exec(`ffmpeg -y -i ${inputFile} -ss 1 -vframes 1 -q:v 2 ${outputPath}`, (error, stdout, stderr) => {
 					if (error) {
 						logger.error(`[transcode-video-operation] (${filename}) Error extracting thumbnail:`, error);
+						if (stderr) {
+							logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
+						}
 						reject(error);
-					} else {
-						resolve(outputPath);
+						return;
 					}
+					
+					// Verify the thumbnail file was actually created and has content
+					if (!fs.existsSync(outputPath)) {
+						const errorMsg = `Thumbnail file was not created: ${outputPath}`;
+						logger.error(`[transcode-video-operation] (${filename}) ${errorMsg}`);
+						if (stderr) {
+							logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
+						}
+						reject(new Error(errorMsg));
+						return;
+					}
+					
+					const fileSize = fs.statSync(outputPath).size;
+					if (fileSize === 0) {
+						const errorMsg = `Thumbnail file is empty: ${outputPath}`;
+						logger.error(`[transcode-video-operation] (${filename}) ${errorMsg}`);
+						if (stderr) {
+							logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
+						}
+						reject(new Error(errorMsg));
+						return;
+					}
+					
+					resolve(outputPath);
 				});
 			});
 		};
@@ -350,7 +395,6 @@ export default {
 				}
 
 				const newFolder = await foldersService.createOne(folderData);
-				logger.debug(`[transcode-video-operation] (${filename}) Folder creation response:`, JSON.stringify(newFolder, null, 2));
 				
 				// Try different possible response structures
 				const folderId = newFolder?.id || newFolder?.data?.id || (typeof newFolder === 'string' ? newFolder : null);
@@ -383,7 +427,19 @@ export default {
 
 				const fileName = path.basename(filePath);
 				const extension = fileName.substr(fileName.lastIndexOf('.') + 1);
+				
+				// Verify file exists before attempting upload
+				if (!fs.existsSync(filePath)) {
+					throw new Error(`File does not exist: ${filePath}`);
+				}
+				
 				const fileSizeInBytes = fs.statSync(filePath).size;
+				const isLocalStorage = targetStorageDriver === 'local';
+				
+				// Only log for cloud storage uploads, not for local storage registration
+				if (!isLocalStorage) {
+					logger.info(`[transcode-video-operation] (${filename}) Uploading file: ${fileName} (${fileSizeInBytes} bytes) to storage: ${targetStorageAdapter}`);
+				}
 				
 				const types: Record<string, string> = {
 					ts: "video/mp2t",
@@ -393,7 +449,7 @@ export default {
 					m3u8: "application/x-mpegurl"
 				};
 
-				const storage = options.storage || targetStorageAdapter;
+				const storage = targetStorageAdapter || options.storage;
 				const mimetype = options.mimetype || types[extension] || 'application/octet-stream';
 
 				// Check if file already exists in Directus
@@ -416,15 +472,10 @@ export default {
 					const existingFile = existingFiles[0];
 					const existingFileId = existingFile?.id || existingFile?.data?.id || (typeof existingFile === 'string' ? existingFile : null);
 					if (existingFileId) {
-						// logger.info(`[transcode-video-operation] (${filename}) File already exists in Directus: ${fileName} (ID: ${existingFileId}), reusing`);
+						logger.info(`[transcode-video-operation] (${filename}) File already exists in Directus: ${fileName} (ID: ${existingFileId}), reusing`);
 						return String(existingFileId);
 					}
 				}
-
-				// Create file stream for FilesService
-				// For local storage: FilesService will use the existing file on disk
-				// For cloud storage: FilesService will upload the stream to the configured adapter (S3, GCS, etc.)
-				const fileStream = fs.createReadStream(filePath);
 
 				// Prepare file data
 				const fileData: any = {
@@ -449,36 +500,82 @@ export default {
 					fileData.folder = folderId;
 				}
 
-				// Create file record in Directus
-				// FilesService handles storage transparently:
-				// - Local storage: Creates DB record, file already exists on disk
-				// - Cloud storage (S3/GCS/Azure/etc.): Uploads fileStream to cloud and creates DB record
-				const fileRecord = await filesService.createOne(
-					fileData,
-					{
-						file: fileStream,
-						title: fileName
+				let fileId: string;
+				try {
+					if (isLocalStorage) {
+						// For local storage: file is already on disk, just create the database record
+						// Use createOne() to avoid moving/copying the file
+						fileId = await filesService.createOne(fileData);
+					} else {
+						// For cloud storage: create a stream and upload to the configured storage adapter
+						const fileStream = fs.createReadStream(filePath);
+						
+						// Handle stream errors
+						fileStream.on('error', (streamError) => {
+							logger.error(`[transcode-video-operation] (${filename}) File stream error for ${fileName}:`, streamError);
+						});
+
+						// Use uploadOne() for cloud storage to upload the file stream
+						// Signature: uploadOne(stream, data, existingPrimaryKey?)
+						fileId = await filesService.uploadOne(
+							fileStream,
+							fileData
+						);
 					}
-				);
+					
+					// Verify which storage was actually used by reading the file record back
+					try {
+						const uploadedFileRecord = await filesService.readOne(fileId);
+						const actualStorage = (uploadedFileRecord as any)?.storage || (uploadedFileRecord as any)?.data?.storage;
+						if (actualStorage !== storage) {
+							logger.warn(`[transcode-video-operation] (${filename}) Storage mismatch! Requested ${storage} but file was stored in ${actualStorage}`);
+						}
+					} catch (verifyError) {
+						// Silently ignore verification errors
+					}
+					
+					// Don't log individual file uploads to reduce log noise (especially for many segment files)
+					// Summary is logged at the end with total file count
+				} catch (uploadError) {
+					const actionVerb = isLocalStorage ? 'registering' : 'uploading';
+					logger.error(`[transcode-video-operation] (${filename}) Error ${actionVerb} file ${fileName}:`, uploadError);
+					throw uploadError;
+				}
 
-
-				// Try different possible response structures
-				const fileId = fileRecord?.id || fileRecord?.data?.id || (typeof fileRecord === 'string' ? fileRecord : null);
-				
-				if (!fileId) {
-					throw new Error(`Failed to get file ID from response. Response: ${JSON.stringify(fileRecord)}`);
+				// uploadOne() returns the file ID directly (PrimaryKey type)
+				if (!fileId || (typeof fileId !== 'string' && typeof fileId !== 'number')) {
+					logger.error(`[transcode-video-operation] (${filename}) Invalid file ID returned from uploadOne: ${fileId}`);
+					throw new Error(`Failed to get file ID from uploadOne. Returned: ${fileId}`);
 				}
 
 				return String(fileId);
 			} catch (error) {
-				logger.error(`[transcode-video-operation] (${filename}) Error creating file record for ${filePath}:`, error);
+				const errorMessage = error instanceof Error ? error.message : String(error);
+				const errorStack = error instanceof Error ? error.stack : undefined;
+				logger.error(`[transcode-video-operation] (${filename}) Error creating file record for ${filePath}: ${errorMessage}`);
+				if (errorStack) {
+					logger.error(`[transcode-video-operation] (${filename}) Error stack: ${errorStack}`);
+				}
 				throw error;
 			}
 		};
 
 		// Parse m3u8 file and replace filenames with file IDs or filename_disk
-		const rebuildPlaylist = (playlistPath: string, fileIdMap: Record<string, string>, useFilenameDisk = false): string => {
+		const rebuildPlaylist = (playlistPath: string, fileIdMap: Record<string, string>, useFilenameDisk = false, logger?: any): string => {
+			// Verify file exists and has content
+			if (!fs.existsSync(playlistPath)) {
+				throw new Error(`Playlist file does not exist: ${playlistPath}`);
+			}
+			const fileSize = fs.statSync(playlistPath).size;
+			if (fileSize === 0) {
+				throw new Error(`Playlist file is empty: ${playlistPath}`);
+			}
+			
 			let content = fs.readFileSync(playlistPath, 'utf-8');
+			if (!content || content.trim().length === 0) {
+				throw new Error(`Playlist file content is empty: ${playlistPath}`);
+			}
+			
 			const lines = content.split('\n');
 			const newLines: string[] = [];
 
@@ -496,6 +593,8 @@ export default {
 					if (filename.startsWith('/assets/')) {
 						filename = filename.substring('/assets/'.length);
 					}
+					// Ensure filename is trimmed (remove any trailing whitespace)
+					filename = filename.trim();
 					
 					// If the line is already a UUID (file ID) and we're using file IDs, keep it as-is
 					if (uuidPattern.test(filename) && !useFilenameDisk) {
@@ -505,17 +604,31 @@ export default {
 					
 					// Also try with just the basename in case path is included
 					const basename = path.basename(filename);
-					const fileId = fileIdMap[filename] || fileIdMap[basename];
+					// Try multiple lookup strategies: exact match, basename match, and trimmed versions
+					const fileId = fileIdMap[filename] || fileIdMap[basename] || fileIdMap[filename.trim()] || fileIdMap[basename.trim()];
 					
 					if (fileId) {
 						if (useFilenameDisk) {
-							// Use filename_disk (the original filename)
+							// Use filename_disk (the original filename) - only when explicitly requested
 							newLines.push(filename);
 						} else {
-							// Use file ID (relative to playlist location)
+							// Use file ID (UUID) - this is the default behavior
 							newLines.push(fileId);
 						}
 					} else {
+						// File ID not found in map - this should not happen if files were uploaded correctly
+						// Log a warning but keep the original filename as fallback
+						// This might happen if fileIdMap wasn't populated correctly
+						if (!useFilenameDisk) {
+							// Only warn if we're trying to use file IDs (not filename_disk)
+							// This indicates a problem with fileIdMap population
+							const availableKeys = Object.keys(fileIdMap).slice(0, 10).join(', ');
+							const exactMatch = fileIdMap.hasOwnProperty(filename);
+							const basenameMatch = fileIdMap.hasOwnProperty(basename);
+							if (logger) {
+								logger.warn(`[transcode-video-operation] File ID not found in map for: "${filename}" (basename: "${basename}"). Exact match: ${exactMatch}, Basename match: ${basenameMatch}. Available keys (first 10): ${availableKeys}...`);
+							}
+						}
 						// Keep original if not found (might be from previous run with different file IDs)
 						newLines.push(line);
 					}
@@ -562,6 +675,41 @@ export default {
 						logger.error(`[transcode-video-operation] (${filename}) FFmpeg not found in stderr for quality: %s`, quality.id);
 						logger.error(`stderr: ${stderr}`);
 						reject(new Error(`FFmpeg command not found. stderr: ${stderr}`));
+						return;
+					}
+
+					// Verify that the playlist file was actually created and has content
+					const expectedPlaylistPath = `${outputDir}/${filename}_${quality.id}p.m3u8`;
+					if (!fs.existsSync(expectedPlaylistPath)) {
+						const errorMsg = `Playlist file was not created: ${expectedPlaylistPath}`;
+						logger.error(`[transcode-video-operation] (${filename}) ${errorMsg}`);
+						if (stderr) {
+							logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
+						}
+						reject(new Error(errorMsg));
+						return;
+					}
+					
+					const playlistSize = fs.statSync(expectedPlaylistPath).size;
+					if (playlistSize === 0) {
+						const errorMsg = `Playlist file is empty: ${expectedPlaylistPath}`;
+						logger.error(`[transcode-video-operation] (${filename}) ${errorMsg}`);
+						if (stderr) {
+							logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
+						}
+						reject(new Error(errorMsg));
+						return;
+					}
+					
+					// Verify playlist has valid content (at least contains #EXTM3U)
+					const playlistContent = fs.readFileSync(expectedPlaylistPath, 'utf-8');
+					if (!playlistContent.includes('#EXTM3U')) {
+						const errorMsg = `Playlist file does not contain valid HLS content: ${expectedPlaylistPath}`;
+						logger.error(`[transcode-video-operation] (${filename}) ${errorMsg}`);
+						if (stderr) {
+							logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
+						}
+						reject(new Error(errorMsg));
 						return;
 					}
 
@@ -625,31 +773,105 @@ export default {
 			// Cloud storage: need to download file first
 			logger.info(`[transcode-video-operation] (${filename}) Source file is in cloud storage (${fileObject.storage}, driver: ${sourceStorageDriver}), downloading to temporary location...`);
 			try {
-				// Get file ID from fileObject
-				const fileId = fileObject.id || (typeof file === 'string' ? file : null);
+				// Get file ID from fileObject - try multiple possible locations
+				let fileId: string | null = null;
+				if (typeof file === 'string') {
+					fileId = file;
+				} else if (fileObject.id) {
+					fileId = String(fileObject.id);
+				} else if ((fileObject as any).data?.id) {
+					fileId = String((fileObject as any).data.id);
+				}
+				
 				if (!fileId) {
+					logger.error(`[transcode-video-operation] (${filename}) Cannot download source file: file ID not found. fileObject keys: ${Object.keys(fileObject).join(', ')}`);
 					return {
-						error: `Cannot download source file: file ID not found`
+						error: `Cannot download source file: file ID not found in fileObject`
 					};
 				}
 
 				// Create temporary directory for downloaded file
 				const tempDir = path.join(process.env.PWD || '/directus', 'tmp', 'transcode');
 				if (!fs.existsSync(tempDir)) {
-					fs.mkdirSync(tempDir, { recursive: true });
+					try {
+						fs.mkdirSync(tempDir, { recursive: true, mode: 0o755 });
+					} catch (error) {
+						const errorMessage = error instanceof Error ? error.message : String(error);
+						logger.error(`[transcode-video-operation] (${filename}) Failed to create temp directory ${tempDir}: ${errorMessage}`);
+						// If it's a permission error and the directory exists (race condition), continue
+						if (errorMessage.includes('EACCES') || errorMessage.includes('permission denied')) {
+							if (fs.existsSync(tempDir)) {
+								logger.warn(`[transcode-video-operation] (${filename}) Temp directory exists but has permission issues. Continuing anyway.`);
+							} else {
+								return {
+									error: `Permission denied creating temp directory ${tempDir}. Please ensure the directory exists on the host with proper permissions (chmod 755) or run: mkdir -p ./tmp && chmod 755 ./tmp`
+								};
+							}
+						} else {
+							return {
+								error: `Failed to create temp directory ${tempDir}: ${errorMessage}`
+							};
+						}
+					}
 				}
 
 				// Download file to temporary location using HTTP request to Directus assets endpoint
 				// This works for all storage types (local, S3, GCS, etc.)
 				const tempFilePath = path.join(tempDir, `${fileId}_${fileObject.filename_disk}`);
 				tempSourceFile = tempFilePath;
+
+				// Validate and construct the asset URL
+				// If PUBLIC_URL is "/" or empty, fallback to HOST + PORT
+				// Otherwise, use PUBLIC_URL as-is
+				const publicUrlRaw = env.PUBLIC_URL;
 				
-				const publicUrl = env.PUBLIC_URL || 'http://localhost:8055';
-				const assetUrl = `${publicUrl}/assets/${fileId}`;
-				const https = require('https');
-				const http = require('http');
+				// Helper to get HOST:PORT for fallback
+				const getHostPort = (): string => {
+					// HOST '0.0.0.0' means listen on all interfaces, but for internal requests use 'localhost'
+					const host = env.HOST && typeof env.HOST === 'string' && env.HOST.trim() !== '' 
+						? (env.HOST.trim() === '0.0.0.0' ? 'localhost' : env.HOST.trim())
+						: 'localhost';
+					const port = env.PORT && typeof env.PORT === 'string' && env.PORT.trim() !== ''
+						? env.PORT.trim()
+						: (env.PORT && typeof env.PORT === 'number' ? String(env.PORT) : '8055');
+					return `http://${host}:${port}`;
+				};
+				
+				let baseUrl: string;
+				if (publicUrlRaw && typeof publicUrlRaw === 'string') {
+					const trimmed = publicUrlRaw.trim();
+					// If it's just '/' or empty, fallback to HOST + PORT
+					if (trimmed === '' || trimmed === '/') {
+						baseUrl = getHostPort();
+					} else {
+						// Use PUBLIC_URL as-is (should be a full URL)
+						baseUrl = trimmed.endsWith('/') ? trimmed.slice(0, -1) : trimmed;
+					}
+				} else {
+					// No PUBLIC_URL set, fallback to HOST + PORT
+					baseUrl = getHostPort();
+				}
+				
+				if (!fileId || typeof fileId !== 'string' || fileId.trim() === '') {
+					logger.error(`[transcode-video-operation] (${filename}) Invalid fileId: ${fileId}`);
+					return {
+						error: `Invalid file ID: ${fileId}`
+					};
+				}
+				
+				const assetUrl = `${baseUrl}/assets/${fileId}`;
+				
+				logger.info(`[transcode-video-operation] (${filename}) Source file is in cloud storage (${sourceStorageDriver}), downloading to temporary location...`);
 				
 				await new Promise<void>((resolve, reject) => {
+					// Validate URL before making request
+					try {
+						new URL(assetUrl);
+					} catch (urlError) {
+						reject(new Error(`Invalid asset URL: ${assetUrl}. Error: ${urlError instanceof Error ? urlError.message : String(urlError)}`));
+						return;
+					}
+					
 					const protocol = assetUrl.startsWith('https') ? https : http;
 					const request = protocol.get(assetUrl, (response) => {
 						if (response.statusCode !== 200) {
@@ -671,15 +893,51 @@ export default {
 				needsCleanup = true;
 				logger.info(`[transcode-video-operation] (${filename}) Source file downloaded to: ${filePath}`);
 			} catch (error) {
-				logger.error(`[transcode-video-operation] (${filename}) Error downloading source file from cloud storage:`, error);
+				const errorMessage = error instanceof Error ? error.message : String(error);
+				const errorStack = error instanceof Error ? error.stack : undefined;
+				logger.error(`[transcode-video-operation] (${filename}) Error downloading source file from cloud storage: ${errorMessage}`);
+				if (errorStack) {
+					logger.error(`[transcode-video-operation] (${filename}) Error stack: ${errorStack}`);
+				}
 				return {
-					error: `Failed to download source file from cloud storage: ${error instanceof Error ? error.message : String(error)}`
+					error: `Failed to download source file from cloud storage: ${errorMessage}`
 				};
 			}
 		}
 		
-		// Set output directory to the same directory as the source file
-		outputDir = path.dirname(filePath);
+		// Determine output directory based on target storage adapter
+		// For local storage: files must be in the target storage location
+		// For cloud storage: can use temp directory, files will be uploaded
+		if (isLocalTarget) {
+			// For local storage, output files must be in the target storage location
+			const targetStoragePath = resolveStorage(targetStorageAdapter);
+			if (!targetStoragePath) {
+				return {
+					error: `No storage found for target location <${targetStorageAdapter}>`
+				};
+			}
+			const basePath = process.env.PWD || '/directus';
+			// Use the same subdirectory structure as the source file (if it exists)
+			const sourceDir = path.dirname(filePath);
+			const sourceStoragePath = resolveStorage(fileObject.storage);
+			let relativePath = '';
+			if (sourceStoragePath) {
+				const sourceStorageFullPath = path.join(basePath, sourceStoragePath);
+				if (sourceDir.startsWith(sourceStorageFullPath)) {
+					// Extract relative path from source storage root
+					relativePath = path.relative(sourceStorageFullPath, sourceDir);
+				}
+			}
+			// If no relative path, just use the target storage root
+			outputDir = relativePath 
+				? path.join(basePath, targetStoragePath, relativePath)
+				: path.join(basePath, targetStoragePath);
+			logger.info(`[transcode-video-operation] (${filename}) Target storage is local (${targetStorageAdapter}), output directory: ${outputDir}`);
+		} else {
+			// For cloud storage, use the same directory as source file (or temp)
+			outputDir = path.dirname(filePath);
+			logger.info(`[transcode-video-operation] (${filename}) Target storage is cloud (${targetStorageAdapter}), output directory: ${outputDir}`);
+		}
 		
 		logger.info(`[transcode-video-operation] (${filename}) File to be transcoded: %s`, filePath)
 		logger.info(`[transcode-video-operation] (${filename}) Output directory: %s`, outputDir)
@@ -829,10 +1087,10 @@ export default {
 		// Generate master playlist dynamically based on available quality files
 		const m3u8Content: string[] = ['#EXTM3U', '#EXT-X-VERSION:3'];
 		
-		// Add available quality streams (only if the file exists)
+		// Add available quality streams (only if the file exists and has content)
 		for (const quality of qualitiesRaw) {
 			const qualityFile = `${outputDir}/${filename}_${quality.id}p.m3u8`;
-			if (fs.existsSync(qualityFile)) {
+			if (fs.existsSync(qualityFile) && fs.statSync(qualityFile).size > 0) {
 				switch (quality.id) {
 					case 240:
 						m3u8Content.push('#EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=426x240', `${filename}_240p.m3u8`);
@@ -853,7 +1111,25 @@ export default {
 			}
 		}
 
-		fs.writeFileSync(`${outputDir}/${filename}_playlist.m3u8`, m3u8Content.join('\n'));
+		// Only write master playlist if we have at least one quality stream
+		if (m3u8Content.length <= 2) {
+			logger.error(`[transcode-video-operation] (${filename}) No valid quality playlists found, cannot create master playlist`);
+			return {
+				error: 'No valid quality playlists found, cannot create master playlist'
+			};
+		}
+
+		const masterPlaylistPath = `${outputDir}/${filename}_playlist.m3u8`;
+		fs.writeFileSync(masterPlaylistPath, m3u8Content.join('\n'));
+		
+		// Verify master playlist was created successfully
+		if (!fs.existsSync(masterPlaylistPath) || fs.statSync(masterPlaylistPath).size === 0) {
+			logger.error(`[transcode-video-operation] (${filename}) Failed to create master playlist: ${masterPlaylistPath}`);
+			return {
+				error: `Failed to create master playlist: ${masterPlaylistPath}`
+			};
+		}
+		
 		logger.info(`[transcode-video-operation] (${filename}) Master playlist created: ${filename}_playlist.m3u8`);
 
 		// Use metadata we already retrieved earlier (sourceMetadata)
@@ -897,30 +1173,74 @@ export default {
 		if (!thumbnailId) {
 			try {
 				await extractThumbnail(filePath, thumbnailPath);
+				// Verify thumbnail was created and has content
+				if (!fs.existsSync(thumbnailPath) || fs.statSync(thumbnailPath).size === 0) {
+					throw new Error(`Thumbnail extraction failed: file does not exist or is empty`);
+				}
 				logger.info(`[transcode-video-operation] (${filename}) Thumbnail extracted`);
 			} catch (error) {
 				logger.error(`[transcode-video-operation] (${filename}) Error extracting thumbnail:`, error);
+				// Don't proceed with thumbnail upload if extraction failed
+				thumbnailId = null;
 			}
 		} else {
 			// Thumbnail exists in Directus, skip extraction
 			logger.info(`[transcode-video-operation] (${filename}) Skipping thumbnail extraction (already exists)`);
 		}
 
-		// Track only the files we actually created (not Directus-generated thumbnails)
-		// Build list of files we know we created:
-		// 1. Segment files (.ts) referenced in each quality playlist (only if they exist on disk)
-		// 2. Quality playlist files (.m3u8)
-		// 3. Master playlist (handled separately)
-		// 4. Thumbnail (handled separately)
-		const createdFiles = new Set<string>();
+		// Track files we created and create filename -> file ID map
+		const fileIdMap: Record<string, string> = {};
+		const uploadedFiles: UploadedFile[] = [];
+
+		// Upload thumbnail first if it exists (or use existing one)
+		if (thumbnailId) {
+			// Thumbnail already exists in Directus, just add to fileIdMap
+			fileIdMap[path.basename(thumbnailPath)] = thumbnailId;
+			uploadedFiles.push({ filename_disk: path.basename(thumbnailPath), id: thumbnailId });
+		} else if (fs.existsSync(thumbnailPath)) {
+			// Thumbnail was just extracted, verify it has content before uploading
+			const thumbnailSize = fs.statSync(thumbnailPath).size;
+			if (thumbnailSize === 0) {
+				const thumbnailAction = targetStorageDriver === 'local' ? 'register' : 'upload';
+				logger.error(`[transcode-video-operation] (${filename}) Thumbnail file is empty, cannot ${thumbnailAction}`);
+			} else {
+				try {
+					// Get thumbnail dimensions
+					let thumbnailWidth: number | null = null;
+					let thumbnailHeight: number | null = null;
+					try {
+						const imageMetadata = await getImageMetadata(thumbnailPath);
+						thumbnailWidth = imageMetadata.width;
+						thumbnailHeight = imageMetadata.height;
+						logger.info(`[transcode-video-operation] (${filename}) Thumbnail dimensions: ${thumbnailWidth}x${thumbnailHeight}`);
+					} catch (error) {
+						logger.warn(`[transcode-video-operation] (${filename}) Could not get thumbnail dimensions:`, error);
+					}
+
+					// Upload thumbnail with metadata
+					thumbnailId = await uploadFileToDirectus(thumbnailPath, targetFolderId, {
+						mimetype: 'image/jpeg',
+						width: thumbnailWidth,
+						height: thumbnailHeight
+					});
+					fileIdMap[path.basename(thumbnailPath)] = thumbnailId;
+					uploadedFiles.push({ filename_disk: path.basename(thumbnailPath), id: thumbnailId });
+					const thumbnailAction = targetStorageDriver === 'local' ? 'registered' : 'uploaded';
+					logger.info(`[transcode-video-operation] (${filename}) Thumbnail ${thumbnailAction}: ${thumbnailId}`);
+				} catch (error) {
+					const thumbnailAction = targetStorageDriver === 'local' ? 'registering' : 'uploading';
+					logger.error(`[transcode-video-operation] (${filename}) Error ${thumbnailAction} thumbnail:`, error);
+				}
+			}
+		}
+
+		// Collect only segment files (not playlists) - we'll rebuild playlists with UUIDs after uploading segments
+		const segmentFiles = new Set<string>();
 
 		// For each quality level, read the playlist to get the segment files
 		for (const quality of qualitiesRaw) {
 			const qualityPlaylistPath = `${outputDir}/${filename}_${quality.id}p.m3u8`;
 			if (fs.existsSync(qualityPlaylistPath)) {
-				// Add the playlist file itself
-				createdFiles.add(`${filename}_${quality.id}p.m3u8`);
-				
 				// Read playlist to get segment file names
 				const playlistContent = fs.readFileSync(qualityPlaylistPath, 'utf-8');
 				const playlistLines = playlistContent.split('\n');
@@ -935,7 +1255,7 @@ export default {
 							// Only add if the file actually exists on disk
 							const segmentFilePath = `${outputDir}/${segmentFile}`;
 							if (fs.existsSync(segmentFilePath)) {
-								createdFiles.add(segmentFile);
+								segmentFiles.add(segmentFile);
 							}
 						}
 					}
@@ -943,66 +1263,21 @@ export default {
 			}
 		}
 
-		// logger.info(`[transcode-video-operation] (${filename}) Found ${createdFiles.size} files created (excluding Directus-generated files)`);
-
-		// Upload all files and create filename -> file ID map
-		const fileIdMap: Record<string, string> = {};
-		const uploadedFiles: UploadedFile[] = [];
-
-		// Upload thumbnail first if it exists (or use existing one)
-		if (thumbnailId) {
-			// Thumbnail already exists in Directus, just add to fileIdMap
-			fileIdMap[path.basename(thumbnailPath)] = thumbnailId;
-			uploadedFiles.push({ filename_disk: path.basename(thumbnailPath), id: thumbnailId });
-		} else if (fs.existsSync(thumbnailPath)) {
-			// Thumbnail was just extracted, upload it
-			try {
-				// Get thumbnail dimensions
-				let thumbnailWidth: number | null = null;
-				let thumbnailHeight: number | null = null;
-				try {
-					const imageMetadata = await getImageMetadata(thumbnailPath);
-					thumbnailWidth = imageMetadata.width;
-					thumbnailHeight = imageMetadata.height;
-					logger.info(`[transcode-video-operation] (${filename}) Thumbnail dimensions: ${thumbnailWidth}x${thumbnailHeight}`);
-				} catch (error) {
-					logger.warn(`[transcode-video-operation] (${filename}) Could not get thumbnail dimensions:`, error);
-				}
-
-				// Upload thumbnail with metadata
-				thumbnailId = await uploadFileToDirectus(thumbnailPath, targetFolderId, {
-					mimetype: 'image/jpeg',
-					width: thumbnailWidth,
-					height: thumbnailHeight
-				});
-				fileIdMap[path.basename(thumbnailPath)] = thumbnailId;
-				uploadedFiles.push({ filename_disk: path.basename(thumbnailPath), id: thumbnailId });
-				logger.info(`[transcode-video-operation] (${filename}) Thumbnail uploaded: ${thumbnailId}`);
-			} catch (error) {
-				logger.error(`[transcode-video-operation] (${filename}) Error uploading thumbnail:`, error);
-			}
-		}
-
-		// Upload only the files we created (segment files and quality playlists)
-		// Master playlist will be uploaded after rebuilding
-		for (const currentFile of createdFiles) {
-			// Skip master playlist (will be uploaded after rebuilding)
-			if (currentFile === `${filename}_playlist.m3u8`) {
-				continue;
-			}
-
-			const filePathToUpload = `${outputDir}/${currentFile}`;
+		// Upload ONLY segment files first (not playlists - we'll rebuild them with UUIDs)
+		logger.info(`[transcode-video-operation] (${filename}) Uploading ${segmentFiles.size} segment files...`);
+		for (const segmentFile of segmentFiles) {
+			const filePathToUpload = `${outputDir}/${segmentFile}`;
 			if (!fs.existsSync(filePathToUpload)) {
-				logger.warn(`[transcode-video-operation] (${filename}) File not found on disk: ${currentFile}`);
+				logger.warn(`[transcode-video-operation] (${filename}) Segment file not found on disk: ${segmentFile}`);
 				continue;
 			}
 
 			try {
 				const fileId = await uploadFileToDirectus(filePathToUpload, targetFolderId);
-				fileIdMap[currentFile] = fileId;
-				uploadedFiles.push({ filename_disk: currentFile, id: fileId });
+				fileIdMap[segmentFile] = fileId;
+				uploadedFiles.push({ filename_disk: segmentFile, id: fileId });
 			} catch (error) {
-				logger.error(`[transcode-video-operation] (${filename}) Error uploading ${currentFile}:`, error);
+				logger.error(`[transcode-video-operation] (${filename}) Error uploading segment ${segmentFile}:`, error);
 			}
 		}
 
@@ -1011,28 +1286,66 @@ export default {
 		const referenceTypeLabel = useFilenameDisk ? 'filename_disk' : 'file IDs';
 		logger.info(`[transcode-video-operation] (${filename}) Rebuilding playlists with ${referenceTypeLabel}...`);
 		
-		// Rebuild quality playlists
+		// Rebuild quality playlists with UUIDs and upload them
 		for (const quality of qualitiesRaw) {
 			const qualityPlaylistPath = `${outputDir}/${filename}_${quality.id}p.m3u8`;
 			if (fs.existsSync(qualityPlaylistPath)) {
-				const rebuiltContent = rebuildPlaylist(qualityPlaylistPath, fileIdMap, useFilenameDisk);
+				// Verify file has content before rebuilding
+				const fileSize = fs.statSync(qualityPlaylistPath).size;
+				if (fileSize === 0) {
+					logger.warn(`[transcode-video-operation] (${filename}) Playlist file ${quality.id}p.m3u8 is empty, skipping rebuild`);
+					continue;
+				}
+				
+				// Rebuild playlist: replace filenames with UUIDs from fileIdMap
+				const rebuiltContent = rebuildPlaylist(qualityPlaylistPath, fileIdMap, useFilenameDisk, logger);
+				if (!rebuiltContent || rebuiltContent.trim().length === 0) {
+					const playlistAction = targetStorageDriver === 'local' ? 'registration' : 'upload';
+					logger.warn(`[transcode-video-operation] (${filename}) Rebuilt playlist content is empty for ${quality.id}p, skipping ${playlistAction}`);
+					continue;
+				}
+				
+				// Write rebuilt playlist to disk
 				fs.writeFileSync(qualityPlaylistPath, rebuiltContent);
 				
-				// Re-upload the rebuilt playlist
+				// Upload the rebuilt playlist (first time - not a re-upload)
 				try {
+					const playlistBasename = path.basename(qualityPlaylistPath);
 					const playlistId = await uploadFileToDirectus(qualityPlaylistPath, targetFolderId);
-					fileIdMap[path.basename(qualityPlaylistPath)] = playlistId;
-					uploadedFiles.push({ filename_disk: path.basename(qualityPlaylistPath), id: playlistId });
-					logger.info(`[transcode-video-operation] (${filename}) Rebuilt and uploaded ${quality.id}p playlist: ${playlistId}`);
+					fileIdMap[playlistBasename] = playlistId;
+					uploadedFiles.push({ filename_disk: playlistBasename, id: playlistId });
+					// Don't log individual playlist uploads to reduce log noise
 				} catch (error) {
-					logger.error(`[transcode-video-operation] (${filename}) Error re-uploading ${quality.id}p playlist:`, error);
+					const playlistAction = targetStorageDriver === 'local' ? 'registering' : 'uploading';
+					logger.error(`[transcode-video-operation] (${filename}) Error ${playlistAction} ${quality.id}p playlist:`, error);
 				}
 			}
 		}
 
-		// Rebuild master playlist
-		const masterPlaylistPath = `${outputDir}/${filename}_playlist.m3u8`;
+		// Rebuild master playlist (masterPlaylistPath was already defined when creating it)
+		if (!fs.existsSync(masterPlaylistPath)) {
+			logger.error(`[transcode-video-operation] (${filename}) Master playlist file does not exist: ${masterPlaylistPath}`);
+			return {
+				error: `Master playlist file does not exist: ${masterPlaylistPath}`
+			};
+		}
+		
+		const masterFileSize = fs.statSync(masterPlaylistPath).size;
+		if (masterFileSize === 0) {
+			logger.error(`[transcode-video-operation] (${filename}) Master playlist file is empty: ${masterPlaylistPath}`);
+			return {
+				error: `Master playlist file is empty: ${masterPlaylistPath}`
+			};
+		}
+		
 		const masterContent = fs.readFileSync(masterPlaylistPath, 'utf-8');
+		if (!masterContent || masterContent.trim().length === 0) {
+			logger.error(`[transcode-video-operation] (${filename}) Master playlist content is empty: ${masterPlaylistPath}`);
+			return {
+				error: `Master playlist content is empty: ${masterPlaylistPath}`
+			};
+		}
+		
 		const masterLines = masterContent.split('\n');
 		const newMasterLines: string[] = [];
 
@@ -1076,24 +1389,23 @@ export default {
 
 		fs.writeFileSync(masterPlaylistPath, newMasterLines.join('\n'));
 		
-		// Upload master playlist
+		// Register/upload master playlist
 		let masterId: string | null = null;
 		try {
 			masterId = await uploadFileToDirectus(masterPlaylistPath, targetFolderId);
 			fileIdMap[path.basename(masterPlaylistPath)] = masterId;
 			uploadedFiles.push({ filename_disk: path.basename(masterPlaylistPath), id: masterId });
-			logger.info(`[transcode-video-operation] (${filename}) Master playlist uploaded: ${masterId}`);
+			// Don't log master playlist upload to reduce log noise
 		} catch (error) {
-			logger.error(`[transcode-video-operation] (${filename}) Error uploading master playlist:`, error);
+			const masterAction = targetStorageDriver === 'local' ? 'registering' : 'uploading';
+			logger.error(`[transcode-video-operation] (${filename}) Error ${masterAction} master playlist:`, error);
 		}
 		
-		logger.info(`[transcode-video-operation] (${filename}) All files uploaded to Directus: ${uploadedFiles.length} files total`);
+		const filesAction = targetStorageDriver === 'local' ? 'registered' : 'uploaded';
+		logger.info(`[transcode-video-operation] (${filename}) All files ${filesAction} to Directus: ${uploadedFiles.length} files total`);
 
 		// Clean up local transcoded files if using cloud storage
 		// For local storage, files should remain on disk
-		const targetStorageDriver = getStorageDriver(targetStorageAdapter);
-		const isLocalTarget = targetStorageDriver === 'local';
-		
 		if (!isLocalTarget) {
 			try {
 				logger.info(`[transcode-video-operation] (${filename}) Cleaning up local transcoded files (using cloud storage: ${targetStorageAdapter})...`);
