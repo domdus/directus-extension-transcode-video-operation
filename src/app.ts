@@ -170,7 +170,7 @@ export default {
 					min: 0,
 					step: 1
 				},
-				note: 'Number of threads to use for encoding. Use 1 for single-threaded, or 0 to use all available CPU cores. Default: 1'
+				note: 'Number of threads to use for transcoding. Use 1 for single-threaded, or 0 to use all available CPU cores. Default: 1'
 			},
 			schema: {
 				default_value: 1

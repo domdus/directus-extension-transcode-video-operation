@@ -1119,7 +1119,7 @@ export default {
 			};
 		}
 
-		const masterPlaylistPath = `${outputDir}/${filename}_playlist.m3u8`;
+		const masterPlaylistPath = `${outputDir}/${filename}_master.m3u8`;
 		fs.writeFileSync(masterPlaylistPath, m3u8Content.join('\n'));
 		
 		// Verify master playlist was created successfully
@@ -1130,7 +1130,7 @@ export default {
 			};
 		}
 		
-		logger.info(`[transcode-video-operation] (${filename}) Master playlist created: ${filename}_playlist.m3u8`);
+		logger.info(`[transcode-video-operation] (${filename}) Master playlist created: ${filename}_master.m3u8`);
 
 		// Use metadata we already retrieved earlier (sourceMetadata)
 		const metadata = sourceMetadata;
@@ -1451,7 +1451,7 @@ export default {
 		}
 
 		return {
-			master: { id: masterId, filename_disk: `${filename}_playlist.m3u8` },
+			master: { id: masterId, filename_disk: `${filename}_master.m3u8` },
 			metadata: {
 				availableQualities,
 				dimensions: {
