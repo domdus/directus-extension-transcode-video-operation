@@ -2,7 +2,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { exec } from "child_process";
+import { spawn } from 'child_process';
 import https from 'https';
 import http from 'http';
 
@@ -14,6 +14,53 @@ declare const process: {
 	};
 	platform: string;
 };
+
+/** Max ffmpeg `-threads` value (0 still means “all cores”). */
+const MAX_FFMPEG_THREADS = 16;
+
+type CommandResult = { stdout: string; stderr: string };
+
+/**
+ * Run a binary with argv only (shell: false) — avoids injection via paths/filenames.
+ */
+function runCommand(command: string, args: string[]): Promise<CommandResult> {
+	return new Promise((resolve, reject) => {
+		const child = spawn(command, args, { shell: false });
+		let stdout = '';
+		let stderr = '';
+
+		child.stdout?.on('data', (chunk: Buffer | string) => {
+			stdout += chunk.toString();
+		});
+		child.stderr?.on('data', (chunk: Buffer | string) => {
+			stderr += chunk.toString();
+		});
+		child.on('error', reject);
+		child.on('close', (code) => {
+			if (code !== 0) {
+				const error = new Error(`${command} exited with code ${code}`) as Error & {
+					stdout?: string;
+					stderr?: string;
+					code?: number | null;
+				};
+				error.stdout = stdout;
+				error.stderr = stderr;
+				error.code = code;
+				reject(error);
+				return;
+			}
+			resolve({ stdout, stderr });
+		});
+	});
+}
+
+async function runFfmpeg(args: string[], niceValue?: number): Promise<CommandResult> {
+	const isWindows = process.platform === 'win32';
+	if (!isWindows && niceValue !== undefined && niceValue !== null) {
+		return runCommand('nice', ['-n', String(niceValue), 'ffmpeg', ...args]);
+	}
+	return runCommand('ffmpeg', args);
+}
 
 interface OperationContext {
 	env: {
@@ -53,7 +100,8 @@ interface OperationInput {
 
 interface QualityOption {
 	id: number;
-	options: string;
+	/** ffmpeg argv after `-y -i <input> -threads <n>` */
+	args: string[];
 }
 
 interface VideoMetadata {
@@ -214,35 +262,68 @@ export default {
 		// outputDir will be set later based on the target storage location
 		let outputDir: string;
 		
-		// Function to generate optimized quality options for raw exec commands
+		// Build HLS quality argv lists (no shell — paths are separate args)
 		const getQualityOptionsRaw = (isHighBitDepth = false): QualityOption[] => {
-			// Always use main profile for maximum compatibility
 			const profile = 'main';
-			
-			// Add pixel format conversion for high bit depth videos
 			const pixelFormat = isHighBitDepth ? 'format=yuv420p,' : '';
-			
+
+			const build = (
+				id: number,
+				maxW: number,
+				maxH: number,
+				crf: number,
+				videoBitrate: string,
+				maxrate: string,
+				bufsize: string,
+				audioBitrate: string,
+			): QualityOption => {
+				const vf = `${pixelFormat}scale=w='min(${maxW},iw)':h='min(${maxH},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2`;
+				return {
+					id,
+					args: [
+						'-vf',
+						vf,
+						'-c:a',
+						'aac',
+						'-ar',
+						'48000',
+						'-c:v',
+						'h264',
+						'-profile:v',
+						profile,
+						'-crf',
+						String(crf),
+						'-sc_threshold',
+						'0',
+						'-g',
+						'48',
+						'-keyint_min',
+						'48',
+						'-hls_time',
+						'4',
+						'-hls_playlist_type',
+						'vod',
+						'-b:v',
+						videoBitrate,
+						'-maxrate',
+						maxrate,
+						'-bufsize',
+						bufsize,
+						'-b:a',
+						audioBitrate,
+						'-hls_segment_filename',
+						path.join(outputDir, `${filename}_${id}p_%03d.ts`),
+						path.join(outputDir, `${filename}_${id}p.m3u8`),
+					],
+				};
+			};
+
 			return [
-				{ 
-					id: 240, 
-					options: `-vf "${pixelFormat}scale=w='min(426,iw)':h='min(240,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2" -c:a aac -ar 48000 -c:v h264 -profile:v ${profile} -crf 22 -sc_threshold 0 -g 48 -keyint_min 48 -hls_time 4 -hls_playlist_type vod -b:v 400k -maxrate 428k -bufsize 600k -b:a 64k -hls_segment_filename ${outputDir}/${filename}_240p_%03d.ts ${outputDir}/${filename}_240p.m3u8`
-				},
-				{ 
-					id: 480, 
-					options: `-vf "${pixelFormat}scale=w='min(854,iw)':h='min(480,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2" -c:a aac -ar 48000 -c:v h264 -profile:v ${profile} -crf 20 -sc_threshold 0 -g 48 -keyint_min 48 -hls_time 4 -hls_playlist_type vod -b:v 1400k -maxrate 1498k -bufsize 2100k -b:a 128k -hls_segment_filename ${outputDir}/${filename}_480p_%03d.ts ${outputDir}/${filename}_480p.m3u8`
-				},
-				{ 
-					id: 720, 
-					options: `-vf "${pixelFormat}scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2" -c:a aac -ar 48000 -c:v h264 -profile:v ${profile} -crf 20 -sc_threshold 0 -g 48 -keyint_min 48 -hls_time 4 -hls_playlist_type vod -b:v 2800k -maxrate 2996k -bufsize 4200k -b:a 128k -hls_segment_filename ${outputDir}/${filename}_720p_%03d.ts ${outputDir}/${filename}_720p.m3u8`
-				},
-				{ 
-					id: 1080, 
-					options: `-vf "${pixelFormat}scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2" -c:a aac -ar 48000 -c:v h264 -profile:v ${profile} -crf 20 -sc_threshold 0 -g 48 -keyint_min 48 -hls_time 4 -hls_playlist_type vod -b:v 5000k -maxrate 5350k -bufsize 7500k -b:a 192k -hls_segment_filename ${outputDir}/${filename}_1080p_%03d.ts ${outputDir}/${filename}_1080p.m3u8`
-				},
-				{ 
-					id: 2160, 
-					options: `-vf "${pixelFormat}scale=w='min(3840,iw)':h='min(2160,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2" -c:a aac -ar 48000 -c:v h264 -profile:v ${profile} -crf 20 -sc_threshold 0 -g 48 -keyint_min 48 -hls_time 4 -hls_playlist_type vod -b:v 20000k -maxrate 21400k -bufsize 30000k -b:a 192k -hls_segment_filename ${outputDir}/${filename}_2160p_%03d.ts ${outputDir}/${filename}_2160p.m3u8`
-				}
+				build(240, 426, 240, 22, '400k', '428k', '600k', '64k'),
+				build(480, 854, 480, 20, '1400k', '1498k', '2100k', '128k'),
+				build(720, 1280, 720, 20, '2800k', '2996k', '4200k', '128k'),
+				build(1080, 1920, 1080, 20, '5000k', '5350k', '7500k', '192k'),
+				build(2160, 3840, 2160, 20, '20000k', '21400k', '30000k', '192k'),
 			];
 		};
 		const hlsFolderId = folder_id;
@@ -254,110 +335,104 @@ export default {
 
 		// Get video metadata (dimensions, duration)
 		const getVideoMetadata = async (inputFile: string): Promise<VideoMetadata> => {
-			return new Promise((resolve, reject) => {
-				// Get width, height, duration, and rotation
-				exec(`ffprobe -v error -select_streams v:0 -show_entries stream=width,height:format=duration -of json ${inputFile}`, 
-					(error, stdout) => {
-						if (error) {
-							logger.error(`[transcode-video-operation] (${filename}) Error getting video metadata:`, error);
-							reject(error);
-							return;
-						}
-						
-						try {
-							const data = JSON.parse(stdout);
-							const stream = data.streams?.[0];
-							const format = data.format;
-							
-							if (!stream || !stream.width || !stream.height) {
-								reject(new Error('Could not get video dimensions'));
-								return;
-							}
-							
-							const width = parseInt(stream.width);
-							const height = parseInt(stream.height);
-							const duration = format?.duration ? Math.floor(parseFloat(format.duration) * 1000) : 0;
-							const isVertical = height > width;
-							
-							resolve({ width, height, isVertical, duration });
-						} catch (parseError) {
-							logger.error(`[transcode-video-operation] (${filename}) Error parsing metadata:`, parseError);
-							reject(parseError);
-						}
-					});
-			});
+			try {
+				const { stdout } = await runCommand('ffprobe', [
+					'-v',
+					'error',
+					'-select_streams',
+					'v:0',
+					'-show_entries',
+					'stream=width,height:format=duration',
+					'-of',
+					'json',
+					inputFile,
+				]);
+
+				const data = JSON.parse(stdout);
+				const stream = data.streams?.[0];
+				const format = data.format;
+
+				if (!stream || !stream.width || !stream.height) {
+					throw new Error('Could not get video dimensions');
+				}
+
+				const width = parseInt(stream.width);
+				const height = parseInt(stream.height);
+				const duration = format?.duration ? Math.floor(parseFloat(format.duration) * 1000) : 0;
+				const isVertical = height > width;
+
+				return { width, height, isVertical, duration };
+			} catch (error) {
+				logger.error(`[transcode-video-operation] (${filename}) Error getting video metadata:`, error);
+				throw error;
+			}
 		};
 
 		// Extract thumbnail at 1 second
 		const extractThumbnail = async (inputFile: string, outputPath: string): Promise<string> => {
-			return new Promise((resolve, reject) => {
-				exec(`ffmpeg -y -i ${inputFile} -ss 1 -vframes 1 -q:v 2 ${outputPath}`, (error, stdout, stderr) => {
-					if (error) {
-						logger.error(`[transcode-video-operation] (${filename}) Error extracting thumbnail:`, error);
-						if (stderr) {
-							logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
-						}
-						reject(error);
-						return;
+			try {
+				const { stderr } = await runFfmpeg(['-y', '-i', inputFile, '-ss', '1', '-vframes', '1', '-q:v', '2', outputPath]);
+
+				if (!fs.existsSync(outputPath)) {
+					const errorMsg = `Thumbnail file was not created: ${outputPath}`;
+					logger.error(`[transcode-video-operation] (${filename}) ${errorMsg}`);
+					if (stderr) {
+						logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
 					}
-					
-					// Verify the thumbnail file was actually created and has content
-					if (!fs.existsSync(outputPath)) {
-						const errorMsg = `Thumbnail file was not created: ${outputPath}`;
-						logger.error(`[transcode-video-operation] (${filename}) ${errorMsg}`);
-						if (stderr) {
-							logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
-						}
-						reject(new Error(errorMsg));
-						return;
+					throw new Error(errorMsg);
+				}
+
+				const fileSize = fs.statSync(outputPath).size;
+				if (fileSize === 0) {
+					const errorMsg = `Thumbnail file is empty: ${outputPath}`;
+					logger.error(`[transcode-video-operation] (${filename}) ${errorMsg}`);
+					if (stderr) {
+						logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
 					}
-					
-					const fileSize = fs.statSync(outputPath).size;
-					if (fileSize === 0) {
-						const errorMsg = `Thumbnail file is empty: ${outputPath}`;
-						logger.error(`[transcode-video-operation] (${filename}) ${errorMsg}`);
-						if (stderr) {
-							logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
-						}
-						reject(new Error(errorMsg));
-						return;
-					}
-					
-					resolve(outputPath);
-				});
-			});
+					throw new Error(errorMsg);
+				}
+
+				return outputPath;
+			} catch (error) {
+				logger.error(`[transcode-video-operation] (${filename}) Error extracting thumbnail:`, error);
+				const stderr = (error as { stderr?: string })?.stderr;
+				if (stderr) {
+					logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
+				}
+				throw error;
+			}
 		};
 
 		// Get image metadata (dimensions)
 		const getImageMetadata = async (imagePath: string): Promise<ImageMetadata> => {
-			return new Promise((resolve, reject) => {
-				exec(`ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of json ${imagePath}`, 
-					(error, stdout) => {
-						if (error) {
-							logger.error(`[transcode-video-operation] (${filename}) Error getting image metadata:`, error);
-							reject(error);
-							return;
-						}
-						
-						try {
-							const data = JSON.parse(stdout);
-							const stream = data.streams?.[0];
-							
-							if (!stream || !stream.width || !stream.height) {
-								reject(new Error('Could not get image dimensions'));
-								return;
-							}
-							
-							const width = parseInt(stream.width);
-							const height = parseInt(stream.height);
-							
-							resolve({ width, height });
-						} catch (parseError) {
-							logger.error(`[transcode-video-operation] (${filename}) Error parsing image metadata:`, parseError);
-							reject(parseError);
-						}
-					});
-			});
+			try {
+				const { stdout } = await runCommand('ffprobe', [
+					'-v',
+					'error',
+					'-select_streams',
+					'v:0',
+					'-show_entries',
+					'stream=width,height',
+					'-of',
+					'json',
+					imagePath,
+				]);
+
+				const data = JSON.parse(stdout);
+				const stream = data.streams?.[0];
+
+				if (!stream || !stream.width || !stream.height) {
+					throw new Error('Could not get image dimensions');
+				}
+
+				return {
+					width: parseInt(stream.width),
+					height: parseInt(stream.height),
+				};
+			} catch (error) {
+				logger.error(`[transcode-video-operation] (${filename}) Error getting image metadata:`, error);
+				throw error;
+			}
 		};
 
 		// Create folder in Directus if it doesn't exist
@@ -639,93 +714,99 @@ export default {
 		};
 
 		function checkFFmpegAvailable(): Promise<void> {
-			return new Promise((resolve, reject) => {
-				exec('which ffmpeg', (error, stdout, stderr) => {
-					if (error || !stdout.trim()) {
-						reject(new Error('FFmpeg is not installed or not found in PATH. Please install ffmpeg.'));
-						return;
-					}
-					resolve();
-				});
-			});
+			return runCommand('ffmpeg', ['-version']).then(
+				() => undefined,
+				() => {
+					throw new Error('FFmpeg is not installed or not found in PATH. Please install ffmpeg.');
+				},
+			);
 		}
 
-		function ffmpegRawSync(inputFile: string, quality: QualityOption, validatedThreads: number, niceValue?: number): Promise<string> {
-			return new Promise((resolve, reject) => {
-				// Build command with optional nice prefix (only on Unix-like systems: Linux, macOS, etc.)
-				// Windows doesn't have 'nice' command, so we skip it on Windows
-				const isWindows = process.platform === 'win32';
-				const nicePrefix = (!isWindows && niceValue !== undefined && niceValue !== null) ? `nice -n ${niceValue} ` : '';
-				if (isWindows && niceValue !== undefined && niceValue !== null) {
-					logger.warn(`[transcode-video-operation] (${filename}) Nice value (${niceValue}) specified but running on Windows - nice command not available, ignoring priority setting`);
+		async function ffmpegRawSync(
+			inputFile: string,
+			quality: QualityOption,
+			validatedThreads: number,
+			niceValue?: number,
+		): Promise<string> {
+			const isWindows = process.platform === 'win32';
+			if (isWindows && niceValue !== undefined && niceValue !== null) {
+				logger.warn(
+					`[transcode-video-operation] (${filename}) Nice value (${niceValue}) specified but running on Windows - nice command not available, ignoring priority setting`,
+				);
+			}
+
+			const ffmpegArgs = ['-y', '-i', inputFile, '-threads', String(validatedThreads), ...quality.args];
+
+			try {
+				const { stdout, stderr } = await runFfmpeg(ffmpegArgs, isWindows ? undefined : niceValue);
+
+				if (stderr && (stderr.includes('not found') || stderr.includes('command not found'))) {
+					logger.error(`[transcode-video-operation] (${filename}) FFmpeg not found in stderr for quality: %s`, quality.id);
+					logger.error(`stderr: ${stderr}`);
+					throw new Error(`FFmpeg command not found. stderr: ${stderr}`);
 				}
-				const command = `${nicePrefix}ffmpeg -y -i ${inputFile} -threads ${validatedThreads} ${quality.options}`;
-				exec(command, (error, stdout, stderr) => {
-					if (error) {
-						logger.error(`[transcode-video-operation] (${filename}) Error occured for quality: %s`, quality.id);
-						logger.error(error.message);
-						logger.error(`stdout: ${stdout}`);
-						logger.error(`stderr: ${stderr}`);
-						reject(new Error(`FFmpeg transcoding failed for quality ${quality.id}p: ${error.message}. stderr: ${stderr}`));
-						return;
-					}
 
-					// Check stderr for common error messages even if exec didn't report an error
-					if (stderr && (stderr.includes('not found') || stderr.includes('command not found'))) {
-						logger.error(`[transcode-video-operation] (${filename}) FFmpeg not found in stderr for quality: %s`, quality.id);
-						logger.error(`stderr: ${stderr}`);
-						reject(new Error(`FFmpeg command not found. stderr: ${stderr}`));
-						return;
+				const expectedPlaylistPath = path.join(outputDir, `${filename}_${quality.id}p.m3u8`);
+				if (!fs.existsSync(expectedPlaylistPath)) {
+					const errorMsg = `Playlist file was not created: ${expectedPlaylistPath}`;
+					logger.error(`[transcode-video-operation] (${filename}) ${errorMsg}`);
+					if (stderr) {
+						logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
 					}
+					throw new Error(errorMsg);
+				}
 
-					// Verify that the playlist file was actually created and has content
-					const expectedPlaylistPath = `${outputDir}/${filename}_${quality.id}p.m3u8`;
-					if (!fs.existsSync(expectedPlaylistPath)) {
-						const errorMsg = `Playlist file was not created: ${expectedPlaylistPath}`;
-						logger.error(`[transcode-video-operation] (${filename}) ${errorMsg}`);
-						if (stderr) {
-							logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
-						}
-						reject(new Error(errorMsg));
-						return;
+				const playlistSize = fs.statSync(expectedPlaylistPath).size;
+				if (playlistSize === 0) {
+					const errorMsg = `Playlist file is empty: ${expectedPlaylistPath}`;
+					logger.error(`[transcode-video-operation] (${filename}) ${errorMsg}`);
+					if (stderr) {
+						logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
 					}
-					
-					const playlistSize = fs.statSync(expectedPlaylistPath).size;
-					if (playlistSize === 0) {
-						const errorMsg = `Playlist file is empty: ${expectedPlaylistPath}`;
-						logger.error(`[transcode-video-operation] (${filename}) ${errorMsg}`);
-						if (stderr) {
-							logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
-						}
-						reject(new Error(errorMsg));
-						return;
-					}
-					
-					// Verify playlist has valid content (at least contains #EXTM3U)
-					const playlistContent = fs.readFileSync(expectedPlaylistPath, 'utf-8');
-					if (!playlistContent.includes('#EXTM3U')) {
-						const errorMsg = `Playlist file does not contain valid HLS content: ${expectedPlaylistPath}`;
-						logger.error(`[transcode-video-operation] (${filename}) ${errorMsg}`);
-						if (stderr) {
-							logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
-						}
-						reject(new Error(errorMsg));
-						return;
-					}
+					throw new Error(errorMsg);
+				}
 
-					logger.info(`[transcode-video-operation] (${filename}) Transcoding finished for quality: %s`, quality.id);
-					resolve(stdout.trim());
-				})
-			})
+				const playlistContent = fs.readFileSync(expectedPlaylistPath, 'utf-8');
+				if (!playlistContent.includes('#EXTM3U')) {
+					const errorMsg = `Playlist file does not contain valid HLS content: ${expectedPlaylistPath}`;
+					logger.error(`[transcode-video-operation] (${filename}) ${errorMsg}`);
+					if (stderr) {
+						logger.error(`[transcode-video-operation] (${filename}) FFmpeg stderr: ${stderr}`);
+					}
+					throw new Error(errorMsg);
+				}
+
+				logger.info(`[transcode-video-operation] (${filename}) Transcoding finished for quality: %s`, quality.id);
+				return stdout.trim();
+			} catch (error) {
+				const err = error as Error & { stdout?: string; stderr?: string };
+				logger.error(`[transcode-video-operation] (${filename}) Error occured for quality: %s`, quality.id);
+				logger.error(err.message);
+				if (err.stdout) logger.error(`stdout: ${err.stdout}`);
+				if (err.stderr) logger.error(`stderr: ${err.stderr}`);
+				throw new Error(
+					`FFmpeg transcoding failed for quality ${quality.id}p: ${err.message}. stderr: ${err.stderr || ''}`,
+				);
+			}
 		}
 	
 		/* Start of the script */
 		logger.info(`[transcode-video-operation] (${filename}) Operation started`);
 		
 		// Ensure threads is a number (may come as string from form input)
-		// 0 means use all available cores, 1+ means use that many threads
+		// 0 means use all available cores; 1+ caps at MAX_FFMPEG_THREADS to limit OOM risk
 		const threadCount = threads !== undefined && threads !== null ? parseInt(String(threads), 10) : 1;
-		const validatedThreads = (isNaN(threadCount) || threadCount < 0) ? 1 : threadCount;
+		let validatedThreads = isNaN(threadCount) || threadCount < 0 ? 1 : threadCount;
+		if (validatedThreads === 0) {
+			logger.warn(
+				`[transcode-video-operation] (${filename}) Thread count 0 uses all CPU cores — high memory risk on 4K/HEVC. Prefer 1–4 on shared hosts.`,
+			);
+		} else if (validatedThreads > MAX_FFMPEG_THREADS) {
+			logger.warn(
+				`[transcode-video-operation] (${filename}) Thread count ${validatedThreads} capped to ${MAX_FFMPEG_THREADS}`,
+			);
+			validatedThreads = MAX_FFMPEG_THREADS;
+		}
 
 		// Validate nice value (may come as string from form input)
 		// Nice values range from 0 (default priority) to 19 (lowest priority)
@@ -958,25 +1039,30 @@ export default {
 		}
 
 		// Check if input is 10-bit by examining the video stream
-		const isHighBitDepth = await new Promise<boolean>((resolve, reject) => {
-				exec(`ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of json ${filePath}`, 
-					(error, stdout) => {
-						if (error) {
-							logger.warn(`[transcode-video-operation] (${filename}) Error checking bit depth, assuming 8-bit: %s`, error.message);
-							resolve(false); // Default to false if check fails
-							return;
-						}
-						try {
-							const data = JSON.parse(stdout);
-							const pixFmt = data.streams?.[0]?.pix_fmt;
-							// Check if pixel format indicates 10-bit (e.g., yuv420p10le)
-							resolve(pixFmt?.includes('10') || false);
-						} catch (parseError) {
-							logger.warn(`[transcode-video-operation] (${filename}) Error parsing bit depth check, assuming 8-bit`);
-							resolve(false);
-						}
-					});
-		});
+		const isHighBitDepth = await (async (): Promise<boolean> => {
+			try {
+				const { stdout } = await runCommand('ffprobe', [
+					'-v',
+					'error',
+					'-select_streams',
+					'v:0',
+					'-show_entries',
+					'stream=pix_fmt',
+					'-of',
+					'json',
+					filePath,
+				]);
+				const data = JSON.parse(stdout);
+				const pixFmt = data.streams?.[0]?.pix_fmt;
+				return pixFmt?.includes('10') || false;
+			} catch (error) {
+				logger.warn(
+					`[transcode-video-operation] (${filename}) Error checking bit depth, assuming 8-bit: %s`,
+					error instanceof Error ? error.message : String(error),
+				);
+				return false;
+			}
+		})();
 
 		if (isHighBitDepth) {
 			logger.info(`[transcode-video-operation] (${filename}) High bit depth detected, will convert to yuv420p`);

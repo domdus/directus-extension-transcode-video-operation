@@ -170,7 +170,7 @@ export default {
 					min: 0,
 					step: 1
 				},
-				note: 'Number of threads to use for transcoding. Use 1 for single-threaded, or 0 to use all available CPU cores. Default: 1'
+				note: 'Number of threads for transcoding. Default 1 (safest). Use 2–4 on larger hosts. 0 = all CPU cores (high memory risk on 4K/HEVC). Values above 16 are capped.',
 			},
 			schema: {
 				default_value: 1

@@ -2,7 +2,7 @@
 	"name": "directus-extension-transcode-video-operation",
 	"description": "Transcode uploaded videos to adaptive HLS streams with multiple quality levels (240p, 480p, 720p, 1080p, 4K)",
 	"icon": "extension",
-	"version": "1.2.0",
+	"version": "1.2.1",
 	"license": "MIT",
 	"keywords": [
 		"directus",
@@ -16,6 +16,11 @@
 		"streaming"
 	],
 	"type": "module",
+	"files": [
+		"dist",
+		"LICENSE",
+		"README.md"
+	],
 	"directus:extension": {
 		"type": "operation",
 		"path": {
@@ -26,7 +31,7 @@
 			"app": "src/app.ts",
 			"api": "src/api.ts"
 		},
-		"host": "^11.0.0"
+		"host": ">=9.26.0 <13.0.0"
 	},
 	"repository": {
 		"type": "git",
