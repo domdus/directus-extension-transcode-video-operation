@@ -3,8 +3,8 @@
 import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
-import https from 'https';
-import http from 'http';
+import { pipeline } from 'stream/promises';
+import { appendCapped, generatedFilePattern, sourceStem, timeoutMsFrom } from './helpers';
 
 // Type declaration for Node.js process global
 declare const process: {
@@ -13,12 +13,18 @@ declare const process: {
 		[key: string]: string | undefined;
 	};
 	platform: string;
+	cwd: () => string;
 };
 
 /** Max ffmpeg `-threads` value (0 still means “all cores”). */
 const MAX_FFMPEG_THREADS = 16;
 
+/** A stuck ffmpeg must not hold a flow forever. Override with TRANSCODE_TIMEOUT_MINUTES. */
+const DEFAULT_TIMEOUT_MINUTES = 360;
+const MAX_CAPTURED_OUTPUT = 256 * 1024;
+
 type CommandResult = { stdout: string; stderr: string };
+
 
 /**
  * Run a binary with argv only (shell: false) — avoids injection via paths/filenames.
@@ -28,15 +34,29 @@ function runCommand(command: string, args: string[]): Promise<CommandResult> {
 		const child = spawn(command, args, { shell: false });
 		let stdout = '';
 		let stderr = '';
+		let timedOut = false;
+		const timeoutMs = timeoutMsFrom(process.env.TRANSCODE_TIMEOUT_MINUTES, DEFAULT_TIMEOUT_MINUTES);
+		const timer = setTimeout(() => {
+			timedOut = true;
+			child.kill('SIGKILL');
+		}, timeoutMs);
 
 		child.stdout?.on('data', (chunk: Buffer | string) => {
-			stdout += chunk.toString();
+			stdout = appendCapped(stdout, chunk, MAX_CAPTURED_OUTPUT);
 		});
 		child.stderr?.on('data', (chunk: Buffer | string) => {
-			stderr += chunk.toString();
+			stderr = appendCapped(stderr, chunk, MAX_CAPTURED_OUTPUT);
 		});
-		child.on('error', reject);
+		child.on('error', (error) => {
+			clearTimeout(timer);
+			reject(error);
+		});
 		child.on('close', (code) => {
+			clearTimeout(timer);
+			if (timedOut) {
+				reject(new Error(`${command} timed out after ${Math.round(timeoutMs / 60_000)} minutes`));
+				return;
+			}
 			if (code !== 0) {
 				const error = new Error(`${command} exited with code ${code}`) as Error & {
 					stdout?: string;
@@ -140,9 +160,14 @@ interface OperationResult {
 	error?: string;
 }
 
-export default {
-	id: 'transcode-video-operation',
-	handler: async (
+/** Temp files to remove however the run ends. */
+type RunCleanup = {
+	tempSourceFile: string | null;
+	tempOutputDir: string | null;
+	isGeneratedFile: ((name: string) => boolean) | null;
+};
+
+const transcode = async (
 		{ 
 			file, 
 			folder_id, 
@@ -153,7 +178,8 @@ export default {
 			storage_adapter = 'default',
 			target_storage
 		}: OperationInput, 
-		{ env, services, getSchema, logger }: OperationContext
+		{ env, services, getSchema, logger }: OperationContext,
+		cleanup: RunCleanup,
 	): Promise<OperationResult | { error: string }> => {
 		if (!file) {
 			logger.info("[transcode-video-operation] Input file missing");
@@ -190,7 +216,13 @@ export default {
 			throw new Error("Input file missing filename_disk");
 		}
 
-		const filename = fileObject.filename_disk.split(('.'))[0];
+		// filename_disk may carry folders (`videos/2024/clip.v2.mp4`); output names use the bare stem.
+		const sourceBasename = path.posix.basename(fileObject.filename_disk);
+		const filename = sourceStem(fileObject.filename_disk);
+		const generatedFile = generatedFilePattern(filename);
+		const storageDir = (root: string): string => path.resolve(process.env.PWD || process.cwd(), root);
+		const toStorageRelative = (root: string, file: string): string =>
+			path.relative(storageDir(root), file).split(path.sep).join('/');
 		const extension = fileObject.filename_disk.substr(fileObject.filename_disk.lastIndexOf('.') + 1);
 
 		// Get available storage locations from environment (STORAGE_LOCATIONS can be CSV string or array)
@@ -329,7 +361,8 @@ export default {
 		const hlsFolderId = folder_id;
 		
 		const readFiles = (linkFilePath: string): string[] => {
-			const data = fs.readdirSync(linkFilePath, 'utf-8').filter(fn => fn.startsWith(filename));
+			// Only this run's outputs: a prefix match would also take an unrelated `clip_2.mp4`.
+			const data = fs.readdirSync(linkFilePath, 'utf-8').filter(fn => generatedFile.test(fn));
 			return data;
 		}
 
@@ -525,11 +558,14 @@ export default {
 				};
 
 				const storage = targetStorageAdapter || options.storage;
+				// Local files stay where ffmpeg wrote them, so the record must carry their folder.
+				const storageRoot = isLocalStorage && storage ? resolveStorage(storage) : null;
+				const diskName = storageRoot ? toStorageRelative(storageRoot, filePath) : fileName;
 				const mimetype = options.mimetype || types[extension] || 'application/octet-stream';
 
 				// Check if file already exists in Directus
 				const filter: any = {
-					filename_disk: { _eq: fileName },
+					filename_disk: { _eq: diskName },
 					storage: { _eq: storage }
 				};
 				if (folderId) {
@@ -555,7 +591,7 @@ export default {
 				// Prepare file data
 				const fileData: any = {
 					storage: storage,
-					filename_disk: fileName,
+					filename_disk: diskName,
 					filename_download: fileName,
 					title: fileName,
 					type: mimetype,
@@ -839,9 +875,7 @@ export default {
 				}
 			}
 			
-			// Construct file path - use process.env.PWD or fallback to /directus
-			const basePath = process.env.PWD || '/directus';
-			filePath = path.join(basePath, `${storagePath}/${fileObject.filename_disk}`);
+			filePath = path.join(storageDir(storagePath), fileObject.filename_disk);
 			
 			// Verify source file exists
 			if (!fs.existsSync(filePath)) {
@@ -896,79 +930,17 @@ export default {
 					}
 				}
 
-				// Download file to temporary location using HTTP request to Directus assets endpoint
-				// This works for all storage types (local, S3, GCS, etc.)
-				const tempFilePath = path.join(tempDir, `${fileId}_${fileObject.filename_disk}`);
+				// Read through Directus rather than HTTP: /assets needs auth for private files.
+				const tempFilePath = path.join(tempDir, `${fileId}_${sourceBasename}`);
 				tempSourceFile = tempFilePath;
+				cleanup.tempSourceFile = tempFilePath;
 
-				// Validate and construct the asset URL
-				// If PUBLIC_URL is "/" or empty, fallback to HOST + PORT
-				// Otherwise, use PUBLIC_URL as-is
-				const publicUrlRaw = env.PUBLIC_URL;
-				
-				// Helper to get HOST:PORT for fallback
-				const getHostPort = (): string => {
-					// HOST '0.0.0.0' means listen on all interfaces, but for internal requests use 'localhost'
-					const host = env.HOST && typeof env.HOST === 'string' && env.HOST.trim() !== '' 
-						? (env.HOST.trim() === '0.0.0.0' ? 'localhost' : env.HOST.trim())
-						: 'localhost';
-					const port = env.PORT && typeof env.PORT === 'string' && env.PORT.trim() !== ''
-						? env.PORT.trim()
-						: (env.PORT && typeof env.PORT === 'number' ? String(env.PORT) : '8055');
-					return `http://${host}:${port}`;
-				};
-				
-				let baseUrl: string;
-				if (publicUrlRaw && typeof publicUrlRaw === 'string') {
-					const trimmed = publicUrlRaw.trim();
-					// If it's just '/' or empty, fallback to HOST + PORT
-					if (trimmed === '' || trimmed === '/') {
-						baseUrl = getHostPort();
-					} else {
-						// Use PUBLIC_URL as-is (should be a full URL)
-						baseUrl = trimmed.endsWith('/') ? trimmed.slice(0, -1) : trimmed;
-					}
-				} else {
-					// No PUBLIC_URL set, fallback to HOST + PORT
-					baseUrl = getHostPort();
-				}
-				
-				if (!fileId || typeof fileId !== 'string' || fileId.trim() === '') {
-					logger.error(`[transcode-video-operation] (${filename}) Invalid fileId: ${fileId}`);
-					return {
-						error: `Invalid file ID: ${fileId}`
-					};
-				}
-				
-				const assetUrl = `${baseUrl}/assets/${fileId}`;
-				
-				logger.info(`[transcode-video-operation] (${filename}) Source file is in cloud storage (${sourceStorageDriver}), downloading to temporary location...`);
-				
-				await new Promise<void>((resolve, reject) => {
-					// Validate URL before making request
-					try {
-						new URL(assetUrl);
-					} catch (urlError) {
-						reject(new Error(`Invalid asset URL: ${assetUrl}. Error: ${urlError instanceof Error ? urlError.message : String(urlError)}`));
-						return;
-					}
-					
-					const protocol = assetUrl.startsWith('https') ? https : http;
-					const request = protocol.get(assetUrl, (response) => {
-						if (response.statusCode !== 200) {
-							reject(new Error(`Failed to download file: HTTP ${response.statusCode}`));
-							return;
-						}
-						const writeStream = fs.createWriteStream(tempFilePath);
-						response.pipe(writeStream);
-						writeStream.on('finish', () => {
-							writeStream.close();
-							resolve();
-						});
-						writeStream.on('error', reject);
-					});
-					request.on('error', reject);
-				});
+				logger.info(`[transcode-video-operation] (${filename}) Source file is in cloud storage (${sourceStorageDriver}), downloading to ${tempFilePath}`);
+
+				const { AssetsService } = services;
+				const assetsService = new AssetsService({ schema: await getSchema() });
+				const { stream } = await assetsService.getAsset(fileId, { transformationParams: {} });
+				await pipeline(stream, fs.createWriteStream(tempFilePath));
 
 				filePath = tempSourceFile;
 				needsCleanup = true;
@@ -997,26 +969,27 @@ export default {
 					error: `No storage found for target location <${targetStorageAdapter}>`
 				};
 			}
-			const basePath = process.env.PWD || '/directus';
 			// Use the same subdirectory structure as the source file (if it exists)
 			const sourceDir = path.dirname(filePath);
 			const sourceStoragePath = resolveStorage(fileObject.storage);
 			let relativePath = '';
 			if (sourceStoragePath) {
-				const sourceStorageFullPath = path.join(basePath, sourceStoragePath);
+				const sourceStorageFullPath = storageDir(sourceStoragePath);
 				if (sourceDir.startsWith(sourceStorageFullPath)) {
 					// Extract relative path from source storage root
 					relativePath = path.relative(sourceStorageFullPath, sourceDir);
 				}
 			}
 			// If no relative path, just use the target storage root
-			outputDir = relativePath 
-				? path.join(basePath, targetStoragePath, relativePath)
-				: path.join(basePath, targetStoragePath);
+			outputDir = relativePath
+				? path.join(storageDir(targetStoragePath), relativePath)
+				: storageDir(targetStoragePath);
 			logger.info(`[transcode-video-operation] (${filename}) Target storage is local (${targetStorageAdapter}), output directory: ${outputDir}`);
 		} else {
 			// For cloud storage, use the same directory as source file (or temp)
 			outputDir = path.dirname(filePath);
+			cleanup.tempOutputDir = outputDir;
+			cleanup.isGeneratedFile = (name) => generatedFile.test(name);
 			logger.info(`[transcode-video-operation] (${filename}) Target storage is cloud (${targetStorageAdapter}), output directory: ${outputDir}`);
 		}
 		
@@ -1490,6 +1463,18 @@ export default {
 		const filesAction = targetStorageDriver === 'local' ? 'registered' : 'uploaded';
 		logger.info(`[transcode-video-operation] (${filename}) All files ${filesAction} to Directus: ${uploadedFiles.length} files total`);
 
+		const targetRoot = isLocalTarget ? resolveStorage(targetStorageAdapter) : null;
+		const masterDiskName = targetRoot ? toStorageRelative(targetRoot, masterPlaylistPath) : `${filename}_master.m3u8`;
+
+		// Determine available qualities before the cloud cleanup below deletes the playlists
+		const availableQualities: number[] = [];
+		for (const quality of qualitiesRaw) {
+			const qualityFile = `${outputDir}/${filename}_${quality.id}p.m3u8`;
+			if (fs.existsSync(qualityFile)) {
+				availableQualities.push(quality.id);
+			}
+		}
+
 		// Clean up local transcoded files if using cloud storage
 		// For local storage, files should remain on disk
 		if (!isLocalTarget) {
@@ -1498,7 +1483,7 @@ export default {
 				const allTranscodedFiles = readFiles(outputDir);
 				for (const fileToDelete of allTranscodedFiles) {
 					// Don't delete the source file
-					if (fileToDelete === fileObject.filename_disk) {
+					if (fileToDelete === sourceBasename) {
 						continue;
 					}
 					const filePathToDelete = `${outputDir}/${fileToDelete}`;
@@ -1527,17 +1512,8 @@ export default {
 			}
 		}
 
-		// Determine available qualities
-		const availableQualities: number[] = [];
-		for (const quality of qualitiesRaw) {
-			const qualityFile = `${outputDir}/${filename}_${quality.id}p.m3u8`;
-			if (fs.existsSync(qualityFile)) {
-				availableQualities.push(quality.id);
-			}
-		}
-
 		return {
-			master: { id: masterId, filename_disk: `${filename}_master.m3u8` },
+			master: { id: masterId, filename_disk: masterDiskName },
 			metadata: {
 				availableQualities,
 				dimensions: {
@@ -1550,5 +1526,29 @@ export default {
 			},
 			files: uploadedFiles
 		};
+};
+
+function removeTempFiles(cleanup: RunCleanup, logger: OperationContext['logger']): void {
+	try {
+		if (cleanup.tempSourceFile) fs.rmSync(cleanup.tempSourceFile, { force: true });
+		if (cleanup.tempOutputDir && cleanup.isGeneratedFile && fs.existsSync(cleanup.tempOutputDir)) {
+			for (const name of fs.readdirSync(cleanup.tempOutputDir)) {
+				if (cleanup.isGeneratedFile(name)) fs.rmSync(path.join(cleanup.tempOutputDir, name), { force: true });
+			}
+		}
+	} catch (error) {
+		logger.warn(`[transcode-video-operation] Could not remove temp files: ${error instanceof Error ? error.message : String(error)}`);
 	}
+}
+
+export default {
+	id: 'transcode-video-operation',
+	handler: async (input: OperationInput, context: OperationContext) => {
+		const cleanup: RunCleanup = { tempSourceFile: null, tempOutputDir: null, isGeneratedFile: null };
+		try {
+			return await transcode(input, context, cleanup);
+		} finally {
+			removeTempFiles(cleanup, context.logger);
+		}
+	},
 };
